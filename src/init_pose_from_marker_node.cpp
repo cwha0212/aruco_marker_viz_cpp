@@ -375,6 +375,10 @@ private:
 
 int main(int argc, char ** argv)
 {
+  // OpenCV 내부 병렬처리(parallel_for_) 비활성화. MultiThreadedExecutor 워커
+  // 스레드에서 detectMarkers 의 내부 스레딩이 힙 손상을 일으키는 문제 회피.
+  // marker_viz 와 동일한 검출 동작을 위해 양쪽 모두 적용.
+  cv::setNumThreads(1);
   rclcpp::init(argc, argv);
   auto node = std::make_shared<InitPoseNode>();
   rclcpp::executors::MultiThreadedExecutor exec(rclcpp::ExecutorOptions(), 2);

@@ -328,6 +328,8 @@ private:
 
 int main(int argc, char ** argv)
 {
+  // init_pose_from_marker 와 동일한 검출 동작(OpenCV 내부 병렬처리 off).
+  cv::setNumThreads(1);
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<MarkerVizNode>());
   rclcpp::shutdown();
