@@ -1,13 +1,11 @@
 // 알려진 ArUco 마커로 로봇 초기위치를 추정해 /initialpose 로 발행하는 ROS2 노드 (C++).
 //
-// 방식(marker_viz 와 동일한 상시 검출 + 캐시):
-//   - 이미지 콜백(상시, 메인 스레드)이 marker_map 의 마커를 계속 검출하고, 각 마커로
-//     계산한 '로봇 map pose'를 최근 num_samples 개 캐시한다. (이미지 발행은 안 함)
-//   - std_srvs/Trigger 서비스가 호출되면 그 시점의 최신 캐시를 평균내어 /initialpose 발행.
-//     현재 대상 마커가 안 보이면(캐시가 오래됨) 실패를 반환한다.
-//   init_pose(body in map) = T(map<-marker)[YAML] * inv( T(body<-cam)*T(cam<-marker) )
-//
-// ★ 검출은 marker_viz 처럼 단일 스레드 rclcpp::spin 의 콜백에서만 실행된다.
+// marker_viz_node 를 그대로 클론해 '검출 경로'를 동일하게 유지한다. 차이점:
+//   - 이미지 발행/그리기/odom 없음. 검출·pose 만.
+//   - 마커의 map pose 는 'ROS2 파라미터'로 받는다(yaml-cpp 사용 안 함 — 이 환경에서
+//     yaml-cpp YAML::LoadFile 이 힙을 손상시켜 이후 OpenCV 검출을 깨뜨렸음).
+//   - 상시 검출로 마커별 로봇 map pose 를 캐시하고, Trigger 서비스가 최신 캐시를 발행.
+//   init_pose(body in map) = T(map<-marker)[params] * inv( T(body<-cam)*T(cam<-marker) )
 #include <chrono>
 #include <cstdio>
 #include <map>
@@ -72,7 +70,6 @@ public:
       "lidar_mount_rpy_deg", {0.0, 0.0, 0.0});
     auto cam_xyz = declare_parameter<std::vector<double>>("cam_mount_xyz", {0.0, 0.0, 0.0});
     auto cam_rpy = declare_parameter<std::vector<double>>("cam_mount_rpy_deg", {0.0, 0.0, 0.0});
-    std::string marker_map_file = declare_parameter<std::string>("marker_map_file", "");
     declare_parameter<int>("target_marker_id", 1);
     std::string init_topic = declare_parameter<std::string>("initialpose_topic", "/initialpose");
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
@@ -87,17 +84,17 @@ public:
     intr_ = buildIntrinsics(calib_file, fx, fy, cx, cy, dist_coeffs, calib_res);
     ext_ = buildBodyCamExtrinsic(lidar_rpy, cam_xyz, cam_rpy);
 
-    if (marker_map_file.empty()) {
-      RCLCPP_ERROR(get_logger(), "marker_map_file 파라미터가 비어있습니다.");
-    } else if (!loadMarkerMap(marker_map_file)) {
-      RCLCPP_ERROR(get_logger(), "marker_map 로드 실패: %s", marker_map_file.c_str());
-    }
-    for (const auto & kv : marker_map_) {map_ids_.insert(kv.first);}
+    // 마커 map pose 를 파라미터로 로드 (yaml-cpp 사용 안 함).
+    loadMarkerMapFromParams();
 
     pub_init_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(init_topic, 10);
 
     auto qos = rclcpp::SensorDataQoS();
-    // marker_viz 와 동일: 일반 구독 콜백(default group) → rclcpp::spin 이 상시 처리.
+    if (!intr_.ok) {
+      sub_cinfo_ = create_subscription<sensor_msgs::msg::CameraInfo>(
+        cam_info_topic, qos, std::bind(&InitPoseNode::onCameraInfo, this, _1));
+    }
+    // marker_viz 와 동일한 일반 구독 콜백(default group, rclcpp::spin 상시 처리).
     if (use_compressed_) {
       sub_cimg_ = create_subscription<sensor_msgs::msg::CompressedImage>(
         image_topic_, qos, std::bind(&InitPoseNode::onCompressed, this, _1));
@@ -105,40 +102,36 @@ public:
       sub_img_ = create_subscription<sensor_msgs::msg::Image>(
         image_topic_, qos, std::bind(&InitPoseNode::onRaw, this, _1));
     }
-    if (!intr_.ok) {
-      sub_cinfo_ = create_subscription<sensor_msgs::msg::CameraInfo>(
-        cam_info_topic, qos, std::bind(&InitPoseNode::onCameraInfo, this, _1));
-    }
     srv_ = create_service<Trigger>(
       "~/estimate_init_pose", std::bind(&InitPoseNode::onService, this, _1, _2));
 
     RCLCPP_INFO(get_logger(),
-      "init_pose_from_marker(C++) 시작 | in=%s initialpose->%s 캘리브=%s (상시 검출)",
-      image_topic_.c_str(), init_topic.c_str(), intr_.ok ? "ON" : "OFF");
+      "init_pose_from_marker(C++) 시작 | in=%s initialpose->%s 캘리브=%s 마커%zu개(상시검출)",
+      image_topic_.c_str(), init_topic.c_str(), intr_.ok ? "ON" : "OFF", marker_map_.size());
   }
 
 private:
-  bool loadMarkerMap(const std::string & path)
+  void loadMarkerMapFromParams()
   {
-    YAML::Node root;
-    try {
-      root = YAML::LoadFile(path);
-    } catch (...) {
-      return false;
-    }
-    if (!root["markers"]) {return false;}
-    for (const auto & m : root["markers"]) {
-      int id = m["id"].as<int>();
-      auto pos = m["position"];
-      auto rpy = m["orientation_rpy_deg"];
+    auto ids = declare_parameter<std::vector<int64_t>>("marker_ids", std::vector<int64_t>{});
+    for (int64_t id : ids) {
+      std::string p = "marker_" + std::to_string(id);
+      auto pos = declare_parameter<std::vector<double>>(p + ".position", {0.0, 0.0, 0.0});
+      auto rpy = declare_parameter<std::vector<double>>(p + ".rpy_deg", {0.0, 0.0, 0.0});
+      if (pos.size() < 3 || rpy.size() < 3) {
+        RCLCPP_WARN(get_logger(), "marker_%ld 파라미터 형식 오류(position/rpy_deg 3원소).", id);
+        continue;
+      }
       MarkerPose mp;
-      mp.t = tf2::Vector3(pos["x"].as<double>(), pos["y"].as<double>(), pos["z"].as<double>());
-      mp.R = rpyDegToMat(rpy["roll"].as<double>(), rpy["pitch"].as<double>(),
-          rpy["yaw"].as<double>());
-      marker_map_[id] = mp;
+      mp.t = tf2::Vector3(pos[0], pos[1], pos[2]);
+      mp.R = rpyDegToMat(rpy[0], rpy[1], rpy[2]);
+      marker_map_[static_cast<int>(id)] = mp;
     }
-    RCLCPP_INFO(get_logger(), "마커 map 로드: %zu개", marker_map_.size());
-    return true;
+    if (marker_map_.empty()) {
+      RCLCPP_ERROR(get_logger(), "marker_ids 파라미터가 비었습니다(마커 map 없음).");
+    } else {
+      RCLCPP_INFO(get_logger(), "마커 map 로드(params): %zu개", marker_map_.size());
+    }
   }
 
   void onCameraInfo(const sensor_msgs::msg::CameraInfo::SharedPtr msg)
@@ -147,87 +140,74 @@ private:
     intr_.K = (cv::Mat_<double>(3, 3) <<
       msg->k[0], msg->k[1], msg->k[2], msg->k[3], msg->k[4], msg->k[5],
       msg->k[6], msg->k[7], msg->k[8]);
-    intr_.dist = msg->d.empty() ? cv::Mat::zeros(1, 5, CV_64F) :
-      cv::Mat(1, static_cast<int>(msg->d.size()), CV_64F);
-    for (size_t i = 0; i < msg->d.size(); ++i) {
-      intr_.dist.at<double>(0, static_cast<int>(i)) = msg->d[i];
+    if (!msg->d.empty()) {
+      intr_.dist = cv::Mat(1, static_cast<int>(msg->d.size()), CV_64F);
+      for (size_t i = 0; i < msg->d.size(); ++i) {
+        intr_.dist.at<double>(0, static_cast<int>(i)) = msg->d[i];
+      }
+    } else {
+      intr_.dist = cv::Mat::zeros(1, 5, CV_64F);
     }
     intr_.ok = true;
     RCLCPP_INFO(get_logger(), "CameraInfo 수신 → 캘리브 활성화.");
   }
 
+  // --- 검출 경로: marker_viz 와 동일 ---
   void onCompressed(const sensor_msgs::msg::CompressedImage::SharedPtr msg)
   {
-    cv::Mat img;
-    try {
-      img = cv::imdecode(cv::Mat(msg->data), cv::IMREAD_COLOR);
-    } catch (const cv::Exception & e) {
-      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000, "imdecode 예외: %s", e.what());
+    cv::Mat img = cv::imdecode(cv::Mat(msg->data), cv::IMREAD_COLOR);
+    if (img.empty()) {
+      RCLCPP_ERROR(get_logger(), "CompressedImage 디코드 실패");
       return;
     }
-    if (!img.empty()) {processFrame(img);}
+    process(img);
   }
 
   void onRaw(const sensor_msgs::msg::Image::SharedPtr msg)
   {
     try {
-      processFrame(cv_bridge::toCvCopy(msg, "bgr8")->image);
+      process(cv_bridge::toCvCopy(msg, "bgr8")->image);
     } catch (const std::exception & e) {
-      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000, "이미지 변환 실패: %s", e.what());
+      RCLCPP_ERROR(get_logger(), "이미지 변환 실패: %s", e.what());
     }
   }
 
-  // 상시 검출: marker_map 의 마커를 검출해 로봇 map pose 를 캐시. (메인 스레드)
-  void processFrame(const cv::Mat & img)
+  void process(cv::Mat img)
   {
-    if (!intr_.ok || img.empty() || intr_.K.empty() || intr_.dist.empty() || map_ids_.empty()) {
-      return;
-    }
-    const char * step = "?";
-    try {
-      step = "scaleK";
-      cv::Mat K = scaleK(intr_.K, intr_.calib_w, intr_.calib_h, img.cols, img.rows);
-      step = "detect";
-      auto markers = detectMarkers(*detector_, img, &map_ids_);
-      auto t = now();
-      for (const auto & [mid, corners] : markers) {
-        if (corners.size() != 4) {continue;}
-        step = "solvePnP";
-        cv::Vec3d rvec, tvec;
-        if (!cv::solvePnP(obj_pts_, corners, K, intr_.dist, rvec, tvec, false,
-          cv::SOLVEPNP_IPPE_SQUARE))
-        {
-          continue;
-        }
-        step = "reproj";
-        double reproj = reprojectionError(obj_pts_, corners, rvec, tvec, K, intr_.dist);
-        if (max_reproj_ > 0 && reproj > max_reproj_) {continue;}
-        step = "pose";
-        tf2::Vector3 pos;
-        tf2::Quaternion quat;
-        robotPoseInMap(mid, rvec, tvec, pos, quat);
+    cv::Mat K = intr_.ok ? scaleK(intr_.K, intr_.calib_w, intr_.calib_h, img.cols, img.rows) :
+      cv::Mat();
+    auto markers = detectMarkers(*detector_, img, nullptr);  // marker_viz 와 동일 (nullptr)
+    auto t = now();
 
-        PoseBuffer & b = cache_[mid];
-        if (b.has && (t - b.last).seconds() > max_pose_age_) {  // 오래된 run 은 버리고 새로
-          b.pos.clear();
-          b.q.clear();
-        }
-        b.pos.push_back(pos);
-        b.q.push_back(quat);
-        while (static_cast<int64_t>(b.pos.size()) > num_samples_) {
-          b.pos.erase(b.pos.begin());
-          b.q.erase(b.q.begin());
-        }
-        b.last = t;
-        b.has = true;
+    for (const auto & [mid, corners] : markers) {
+      if (marker_map_.find(mid) == marker_map_.end()) {continue;}  // map 에 있는 마커만
+      if (!intr_.ok) {continue;}
+      cv::Vec3d rvec, tvec;
+      if (!cv::solvePnP(obj_pts_, corners, K, intr_.dist, rvec, tvec, false,
+        cv::SOLVEPNP_IPPE_SQUARE))
+      {
+        continue;
       }
-    } catch (const cv::Exception & e) {
-      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
-        "processFrame 예외 @%s: %s", step, e.what());
+      double reproj = reprojectionError(obj_pts_, corners, rvec, tvec, K, intr_.dist);
+      if (max_reproj_ > 0 && reproj > max_reproj_) {continue;}
+
+      tf2::Vector3 pos;
+      tf2::Quaternion quat;
+      robotPoseInMap(mid, rvec, tvec, pos, quat);
+
+      PoseBuffer & b = cache_[mid];
+      if (b.has && (t - b.last).seconds() > max_pose_age_) {b.pos.clear(); b.q.clear();}
+      b.pos.push_back(pos);
+      b.q.push_back(quat);
+      while (static_cast<int64_t>(b.pos.size()) > num_samples_) {
+        b.pos.erase(b.pos.begin());
+        b.q.erase(b.q.begin());
+      }
+      b.last = t;
+      b.has = true;
     }
   }
 
-  // 서비스: 현재 캐시(최신 검출)를 평균내어 /initialpose 발행.
   void onService(
     const std::shared_ptr<Trigger::Request>, std::shared_ptr<Trigger::Response> resp)
   {
@@ -239,7 +219,7 @@ private:
     }
     if (marker_map_.find(target) == marker_map_.end()) {
       resp->success = false;
-      resp->message = "marker_map 에 id=" + std::to_string(target) + " 없음.";
+      resp->message = "marker map 에 id=" + std::to_string(target) + " 없음.";
       return;
     }
     auto it = cache_.find(target);
@@ -335,8 +315,7 @@ private:
   Intrinsics intr_;
   Extrinsic ext_;
   std::map<int, MarkerPose> marker_map_;
-  std::set<int> map_ids_;
-  std::map<int, PoseBuffer> cache_;  // 마커별 최근 로봇 map pose
+  std::map<int, PoseBuffer> cache_;
 
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pub_init_;
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr sub_cimg_;

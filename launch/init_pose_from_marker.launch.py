@@ -20,7 +20,8 @@ def generate_launch_description():
 
     params_arg = DeclareLaunchArgument('params_file', default_value=default_params)
     marker_map_arg = DeclareLaunchArgument(
-        'marker_map_file', default_value=default_marker_map)
+        'marker_map_file', default_value=default_marker_map,
+        description='마커 map pose 파라미터 파일(ROS2 params)')
     calib_arg = DeclareLaunchArgument('calib_file', default_value='')
     target_arg = DeclareLaunchArgument('target_marker_id', default_value='1')
 
@@ -31,8 +32,8 @@ def generate_launch_description():
         output='screen',
         parameters=[
             LaunchConfiguration('params_file'),
+            LaunchConfiguration('marker_map_file'),  # 마커 map 을 params 파일로 병합
             {
-                'marker_map_file': LaunchConfiguration('marker_map_file'),
                 'calib_file': LaunchConfiguration('calib_file'),
                 'target_marker_id': ParameterValue(
                     LaunchConfiguration('target_marker_id'), value_type=int),
