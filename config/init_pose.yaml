@@ -26,6 +26,6 @@
     initialpose_topic: /initialpose
     map_frame: map
     max_reproj_error: 4.0          # px, 초과 검출 샘플 제외
-    num_samples: 5                 # 평균낼 양호 검출 프레임 수
-    search_timeout_sec: 0.0        # 0 = 인식할 때까지 무한 대기
+    num_samples: 5                 # 평균낼 최근 검출 프레임 수(롤링)
+    max_pose_age_sec: 1.0          # 서비스 호출 시 캐시가 이보다 오래되면 '미검출'로 실패
     pose_covariance_diag: [0.1, 0.1, 0.1, 0.05, 0.05, 0.05]
