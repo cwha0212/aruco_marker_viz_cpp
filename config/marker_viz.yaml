@@ -41,3 +41,16 @@
     # x,y 는 미측정(대략 0). 정확 측정하면 갱신 권장.
     cam_mount_xyz: [0.0, 0.0, -0.17]
     cam_mount_rpy_deg: [0.0, 0.0, 0.0]   # 카메라는 정면 응시
+
+    # ── 초기위치 추정(init_pose): ~/estimate_init_pose 서비스 ──
+    # marker_ids 의 마커를 상시 검출해 로봇 map pose 를 캐시하고, 서비스 호출 시 발행.
+    initialpose_topic: /initialpose
+    target_marker_id: 1                  # 초기화에 쓸 마커 (ros2 param set 으로 변경 가능)
+    num_samples: 5                       # 평균낼 최근 검출 프레임 수
+    max_pose_age_sec: 1.0                # 캐시가 이보다 오래되면 '미검출'로 실패
+    pose_covariance_diag: [0.1, 0.1, 0.1, 0.05, 0.05, 0.05]
+    # 마커 map pose (X右 Y上 Z정면바깥). marker_viz 로그값을 옮겨 적음.
+    marker_ids: [1]
+    marker_1:
+      position: [37.884, 5.739, -0.638]
+      rpy_deg: [78.1, 7.0, -169.0]

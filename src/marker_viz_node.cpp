@@ -17,11 +17,30 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <std_srvs/srv/trigger.hpp>
+#include <map>
 
 #include "aruco_marker_viz_cpp/aruco_common.hpp"
 
 using namespace aruco_common;
 using std::placeholders::_1;
+using std::placeholders::_2;
+using Trigger = std_srvs::srv::Trigger;
+
+// 마커 map pose(파라미터) 및 로봇 map pose 캐시 (초기위치 추정용).
+struct MapMarker
+{
+  tf2::Matrix3x3 R;
+  tf2::Vector3 t;
+};
+struct PoseBuffer
+{
+  std::vector<tf2::Vector3> pos;
+  std::vector<tf2::Quaternion> q;
+  rclcpp::Time last;
+  bool has{false};
+};
 
 class MarkerVizNode : public rclcpp::Node
 {
@@ -111,8 +130,31 @@ public:
         image_topic_, qos, std::bind(&MarkerVizNode::onRaw, this, _1));
     }
 
-    RCLCPP_INFO(get_logger(), "marker_viz(C++) 시작 | in=%s 거리/축=%s",
-      image_topic_.c_str(), intr_.ok ? "ON" : "OFF(캘리브 없음)");
+    // ── 초기위치 추정(init_pose) 기능 ──
+    std::string init_topic = declare_parameter<std::string>("initialpose_topic", "/initialpose");
+    declare_parameter<int>("target_marker_id", 1);
+    ip_num_samples_ = std::max<int64_t>(1, declare_parameter<int>("num_samples", 5));
+    ip_max_age_ = declare_parameter<double>("max_pose_age_sec", 1.0);
+    ip_cov_diag_ = declare_parameter<std::vector<double>>(
+      "pose_covariance_diag", {0.1, 0.1, 0.1, 0.05, 0.05, 0.05});
+    auto mids = declare_parameter<std::vector<int64_t>>("marker_ids", std::vector<int64_t>{});
+    for (int64_t id : mids) {
+      std::string mp = "marker_" + std::to_string(id);
+      auto pos = declare_parameter<std::vector<double>>(mp + ".position", {0.0, 0.0, 0.0});
+      auto rpy = declare_parameter<std::vector<double>>(mp + ".rpy_deg", {0.0, 0.0, 0.0});
+      if (pos.size() >= 3 && rpy.size() >= 3) {
+        MapMarker m;
+        m.t = tf2::Vector3(pos[0], pos[1], pos[2]);
+        m.R = rpyDegToMat(rpy[0], rpy[1], rpy[2]);
+        marker_map_[static_cast<int>(id)] = m;
+      }
+    }
+    pub_init_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(init_topic, 10);
+    srv_ = create_service<Trigger>(
+      "~/estimate_init_pose", std::bind(&MarkerVizNode::onEstimateInitPose, this, _1, _2));
+
+    RCLCPP_INFO(get_logger(), "marker_viz(C++) 시작 | in=%s 거리/축=%s init_pose마커=%zu개",
+      image_topic_.c_str(), intr_.ok ? "ON" : "OFF(캘리브 없음)", marker_map_.size());
   }
 
 private:
@@ -205,6 +247,10 @@ private:
       cv::Point p0(cvRound(corners[0].x), cvRound(corners[0].y));
       std::string label = "id" + std::to_string(mid);
       if (have_pose && !bad) {
+        // 초기위치 추정: map 에 등록된 마커면 로봇 map pose 캐시.
+        if (marker_map_.find(mid) != marker_map_.end()) {
+          updateInitPoseCache(mid, rvec, tvec);
+        }
         if (draw_needed && draw_axes_) {
           drawAxes(img, K, intr_.dist, rvec, tvec, marker_size_ * 0.5);
         }
@@ -299,6 +345,101 @@ private:
     return true;
   }
 
+  // ── 초기위치 추정 헬퍼 ──
+  void updateInitPoseCache(int mid, const cv::Vec3d & rvec, const cv::Vec3d & tvec)
+  {
+    // 로봇(body) map pose = T(map<-marker)[param] * inv( T(body<-cam)*T(cam<-marker) )
+    tf2::Matrix3x3 R_cam_marker = cvRodriguesToMat(rvec);
+    tf2::Vector3 t_cam_marker(tvec[0], tvec[1], tvec[2]);
+    tf2::Matrix3x3 R_body_marker = ext_.R_body_cam * R_cam_marker;
+    tf2::Vector3 t_body_marker = ext_.R_body_cam * t_cam_marker + ext_.t_body_cam;
+    tf2::Matrix3x3 R_marker_body = R_body_marker.transpose();
+    tf2::Vector3 t_marker_body = -(R_marker_body * t_body_marker);
+    const MapMarker & m = marker_map_.at(mid);
+    tf2::Matrix3x3 R_map_body = m.R * R_marker_body;
+    tf2::Vector3 pos = m.R * t_marker_body + m.t;
+    tf2::Quaternion quat = matToQuat(R_map_body);
+
+    PoseBuffer & b = ip_cache_[mid];
+    auto t = now();
+    if (b.has && (t - b.last).seconds() > ip_max_age_) {b.pos.clear(); b.q.clear();}
+    b.pos.push_back(pos);
+    b.q.push_back(quat);
+    while (static_cast<int64_t>(b.pos.size()) > ip_num_samples_) {
+      b.pos.erase(b.pos.begin());
+      b.q.erase(b.q.begin());
+    }
+    b.last = t;
+    b.has = true;
+  }
+
+  void onEstimateInitPose(
+    const std::shared_ptr<Trigger::Request>, std::shared_ptr<Trigger::Response> resp)
+  {
+    int target = static_cast<int>(get_parameter("target_marker_id").as_int());
+    if (marker_map_.find(target) == marker_map_.end()) {
+      resp->success = false;
+      resp->message = "marker map 에 id=" + std::to_string(target) + " 없음.";
+      return;
+    }
+    auto it = ip_cache_.find(target);
+    if (it == ip_cache_.end() || !it->second.has || it->second.pos.empty() ||
+      (now() - it->second.last).seconds() > ip_max_age_)
+    {
+      resp->success = false;
+      resp->message = "현재 id=" + std::to_string(target) +
+        " 마커가 검출되지 않음(마커를 카메라에 보이게 한 뒤 호출).";
+      RCLCPP_WARN(get_logger(), "[init_pose] %s", resp->message.c_str());
+      return;
+    }
+    const PoseBuffer & b = it->second;
+    tf2::Vector3 avg = ipMeanPos(b.pos);
+    tf2::Quaternion aq = ipAvgQuat(b.q);
+    geometry_msgs::msg::PoseWithCovarianceStamped msg;
+    msg.header.stamp = now();
+    msg.header.frame_id = map_frame_;
+    msg.pose.pose.position.x = avg.x();
+    msg.pose.pose.position.y = avg.y();
+    msg.pose.pose.position.z = avg.z();
+    msg.pose.pose.orientation.x = aq.x();
+    msg.pose.pose.orientation.y = aq.y();
+    msg.pose.pose.orientation.z = aq.z();
+    msg.pose.pose.orientation.w = aq.w();
+    for (int i = 0; i < 6; ++i) {
+      msg.pose.covariance[i * 6 + i] =
+        (i < static_cast<int>(ip_cov_diag_.size())) ? ip_cov_diag_[i] : 0.0;
+    }
+    pub_init_->publish(msg);
+    auto rpy = matToRpyDeg(tf2::Matrix3x3(aq));
+    char buf[176];
+    std::snprintf(buf, sizeof(buf),
+      "id=%d init_pose 발행 pos=(%.3f, %.3f, %.3f) yaw=%.1fdeg (n=%zu)",
+      target, avg.x(), avg.y(), avg.z(), rpy[2], b.pos.size());
+    resp->success = true;
+    resp->message = buf;
+    RCLCPP_INFO(get_logger(), "[init_pose] %s", buf);
+  }
+
+  static tf2::Vector3 ipMeanPos(const std::vector<tf2::Vector3> & v)
+  {
+    tf2::Vector3 s(0, 0, 0);
+    for (const auto & p : v) {s += p;}
+    return s / static_cast<double>(v.size());
+  }
+
+  static tf2::Quaternion ipAvgQuat(const std::vector<tf2::Quaternion> & v)
+  {
+    tf2::Quaternion ref = v.front();
+    double x = 0, y = 0, z = 0, w = 0;
+    for (auto q : v) {
+      if (q.dot(ref) < 0) {q = tf2::Quaternion(-q.x(), -q.y(), -q.z(), -q.w());}
+      x += q.x(); y += q.y(); z += q.z(); w += q.w();
+    }
+    tf2::Quaternion out(x, y, z, w);
+    double n = out.length();
+    return n > 0 ? out / n : ref;
+  }
+
   std::string image_topic_, map_frame_;
   bool use_compressed_{true}, has_id_filter_{false}, draw_distance_{true}, draw_axes_{true};
   double marker_size_{0.185}, max_reproj_{4.0};
@@ -324,6 +465,15 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_img_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr sub_cinfo_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
+
+  // 초기위치 추정
+  std::map<int, MapMarker> marker_map_;
+  std::map<int, PoseBuffer> ip_cache_;
+  int64_t ip_num_samples_{5};
+  double ip_max_age_{1.0};
+  std::vector<double> ip_cov_diag_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pub_init_;
+  rclcpp::Service<Trigger>::SharedPtr srv_;
 };
 
 int main(int argc, char ** argv)
