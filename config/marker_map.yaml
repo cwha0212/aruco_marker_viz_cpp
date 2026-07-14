@@ -12,8 +12,5 @@
 
 markers:
   - id: 1
-    position: {x: 3.00, y: 1.50, z: 0.40}
-    orientation_rpy_deg: {roll: 0.0, pitch: 0.0, yaw: 180.0}
-  - id: 2
-    position: {x: -2.00, y: 0.00, z: 0.35}
-    orientation_rpy_deg: {roll: 0.0, pitch: 0.0, yaw: 90.0}
+    position: {x: 37.884, y: 5.739, z: -0.638}
+    orientation_rpy_deg: {roll: 78.1, pitch: 7.0, yaw: -169.0}
