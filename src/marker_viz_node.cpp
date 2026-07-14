@@ -1,5 +1,6 @@
 // 이미지 토픽을 받아 ArUco 마커를 검출·표시한 이미지를 발행하는 ROS2 노드 (C++).
 // map 좌표(위치 + rpy)는 /aft_mapped_to_init + 외부파라미터가 있을 때 계산·로그·발행한다.
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <optional>
@@ -136,7 +137,10 @@ private:
 
   void onCompressed(const sensor_msgs::msg::CompressedImage::SharedPtr msg)
   {
+    auto t = std::chrono::steady_clock::now();
     cv::Mat img = cv::imdecode(cv::Mat(msg->data), cv::IMREAD_COLOR);
+    last_decode_ms_ = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t).count();
     if (img.empty()) {
       RCLCPP_ERROR(get_logger(), "CompressedImage 디코드 실패");
       return;
@@ -155,9 +159,11 @@ private:
 
   void process(cv::Mat img, const std_msgs::msg::Header & header)
   {
+    auto t0 = std::chrono::steady_clock::now();
     cv::Mat K = intr_.ok ? scaleK(intr_.K, intr_.calib_w, intr_.calib_h, img.cols, img.rows) :
       cv::Mat();
     auto markers = detectMarkers(*detector_, img, has_id_filter_ ? &allowed_ids_ : nullptr);
+    auto t1 = std::chrono::steady_clock::now();
 
     geometry_msgs::msg::PoseArray map_arr;
     map_arr.header.stamp = header.stamp;
@@ -211,8 +217,17 @@ private:
         0.7, color, 2, cv::LINE_AA);
     }
 
+    auto t2 = std::chrono::steady_clock::now();
     auto out = cv_bridge::CvImage(header, "bgr8", img).toImageMsg();
     pub_->publish(*out);
+    auto t3 = std::chrono::steady_clock::now();
+    auto ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+      };
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+      "timing[ms]: decode=%.1f detect=%.1f pnp/draw=%.1f encode/pub=%.1f | total(proc)=%.1f "
+      "(markers=%zu, %dx%d)", last_decode_ms_, ms(t0, t1), ms(t1, t2), ms(t2, t3),
+      last_decode_ms_ + ms(t0, t3), markers.size(), img.cols, img.rows);
 
     if (!map_arr.poses.empty()) {
       pub_map_->publish(map_arr);
@@ -265,6 +280,7 @@ private:
   bool have_odom_{false};
   tf2::Matrix3x3 R_map_body_;
   tf2::Vector3 t_map_body_;
+  double last_decode_ms_{0.0};
 
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_map_;
