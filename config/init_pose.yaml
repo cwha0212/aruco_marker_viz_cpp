@@ -1,0 +1,31 @@
+/init_pose_from_marker:
+  ros__parameters:
+    image_topic: /camera/image_raw/compressed
+    use_compressed: true
+    aruco_dict: DICT_4X4_50
+    marker_size: 0.185
+
+    # 카메라 내부 파라미터 (Kalibr 1280x720 pinhole-radtan). calib_file 주면 그게 우선.
+    calib_file: ''
+    camera_info_topic: /camera/camera_info
+    fx: 693.63719436
+    fy: 696.14717994
+    cx: 623.66167469
+    cy: 330.68319062
+    dist_coeffs: [-0.3001462, 0.07451067, -0.00028039, 0.00027014, 0.0]
+    calib_resolution: [1280, 720]
+
+    # 외부 파라미터(정면 FLU 기준). marker_viz 와 동일 값으로 맞출 것.
+    lidar_mount_rpy_deg: [0.0, -20.0, 180.0]
+    cam_mount_xyz: [0.0, 0.0, -0.17]
+    cam_mount_rpy_deg: [0.0, 0.0, 0.0]
+
+    # 초기위치 추정
+    marker_map_file: ''            # marker_map.yaml 절대경로(런치에서 기본 주입)
+    target_marker_id: 1            # 대상 마커 ID (ros2 param set 으로 변경 가능)
+    initialpose_topic: /initialpose
+    map_frame: map
+    max_reproj_error: 4.0          # px, 초과 검출 샘플 제외
+    num_samples: 5                 # 평균낼 양호 검출 프레임 수
+    search_timeout_sec: 0.0        # 0 = 인식할 때까지 무한 대기
+    pose_covariance_diag: [0.1, 0.1, 0.1, 0.05, 0.05, 0.05]

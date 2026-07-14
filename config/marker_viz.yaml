@@ -1,0 +1,36 @@
+/aruco_marker_viz:
+  ros__parameters:
+    image_topic: /camera/image_raw/compressed
+    use_compressed: true
+    output_topic: ~/image_markers        # 마커가 그려진 이미지 발행 토픽
+
+    aruco_dict: DICT_4X4_50
+    ids: ''                              # 허용 ID 문자열(예: '1' 또는 '1,2'). 빈 값=전체
+
+    # 거리/좌표축 표시용 카메라 내부 파라미터. 아래 셋 중 하나(우선순위 순).
+    #  1) calib_file (Kalibr camchain yaml) 2) fx/fy 파라미터 3) camera_info_topic
+    marker_size: 0.185                   # 마커 한 변 실제 길이(m)
+    calib_file: ''                       # Kalibr camchain yaml 경로(주면 아래 fx/fy 대신 사용)
+    camera_info_topic: /camera/camera_info
+    # Kalibr 캘리브레이션 결과(calibration_bag-camchain.yaml, 1280x720 pinhole-radtan)
+    fx: 693.63719436
+    fy: 696.14717994
+    cx: 623.66167469
+    cy: 330.68319062
+    dist_coeffs: [-0.3001462, 0.07451067, -0.00028039, 0.00027014, 0.0]  # radtan [k1,k2,p1,p2,k3]
+    calib_resolution: [1280, 720]        # 캘리브 해상도. 다른 해상도 이미지면 자동 스케일
+
+    max_reproj_error: 4.0                # px, 초과 검출은 빨강+‘bad’ 표시, 0=끄기
+    draw_distance: true                  # 거리 텍스트 표시
+    draw_axes: true                      # 좌표축 표시
+
+    # ── 마커 map 좌표 계산 (/aft_mapped_to_init 필요) ──
+    odom_topic: /aft_mapped_to_init      # LIO 의 map 기준 바디 pose (nav_msgs/Odometry)
+    map_frame: map
+    # 외부 파라미터는 모두 '로봇 정면(FLU: x前 y左 z上)' 기준. 내부에서 라이다 프레임 변환.
+    # 라이다: 정면 기준 yaw 180, pitch 20 회전 장착 (roll,pitch,yaw 순).
+    lidar_mount_rpy_deg: [0.0, 0.0, 0.0]
+    # 카메라 위치(라이다 기준, 정면축[m]): 라이다가 ~17cm 위 → 카메라는 z로 -0.17.
+    # x,y 는 미측정(대략 0). 정확 측정하면 갱신 권장.
+    cam_mount_xyz: [0.0, 0.0, -0.17]
+    cam_mount_rpy_deg: [0.0, 0.0, 0.0]   # 카메라는 정면 응시

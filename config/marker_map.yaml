@@ -1,0 +1,19 @@
+# 마커별 map 기준 pose. init_pose_from_marker_node 가 초기위치 추정에 사용한다.
+#
+# position            : map 프레임에서 마커 중심의 위치 [m]
+# orientation_rpy_deg : '마커 좌표계'의 map 기준 자세 [deg]
+#     마커 좌표계 = X:오른쪽, Y:위, Z:마커 평면 바깥(정면). (solvePnP object_points 규약)
+#     yaw=0  → 마커 정면(Z축)이 map +x 를 향함
+#     yaw=90 → 마커 정면이 map +y 를 향함
+#     yaw=180→ 마커 정면이 map -x 를 향함
+#
+# 값은 marker_viz_node 로그의 "position=(...) orientation_rpy_deg=(...)" 를
+# 그대로 옮겨 적으면 된다(로봇을 마커 앞에 두고 실측).
+
+markers:
+  - id: 1
+    position: {x: 3.00, y: 1.50, z: 0.40}
+    orientation_rpy_deg: {roll: 0.0, pitch: 0.0, yaw: 180.0}
+  - id: 2
+    position: {x: -2.00, y: 0.00, z: 0.35}
+    orientation_rpy_deg: {roll: 0.0, pitch: 0.0, yaw: 90.0}

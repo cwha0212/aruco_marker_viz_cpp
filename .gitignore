@@ -1,0 +1,7 @@
+# ROS2 / colcon 산출물 (이 패키지가 ws/src 아래 있을 때)
+build/
+install/
+log/
+
+# OS
+.DS_Store
