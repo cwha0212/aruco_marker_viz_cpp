@@ -89,6 +89,10 @@ public:
     pub_ = create_publisher<sensor_msgs::msg::Image>(out_topic, qos);
     pub_comp_ = create_publisher<sensor_msgs::msg::CompressedImage>(
       out_topic + "/compressed", qos);
+    // 이미지 발행 제어. 무거운 raw 는 기본 off, compressed 만 기본 on.
+    publish_image_ = declare_parameter<bool>("publish_image", true);
+    publish_raw_ = declare_parameter<bool>("publish_raw", false);
+    publish_compressed_ = declare_parameter<bool>("publish_compressed", true);
     jpeg_quality_ = declare_parameter<int>("jpeg_quality", 80);
     pub_map_ = create_publisher<geometry_msgs::msg::PoseArray>("~/marker_map_poses", 10);
     pub_pt_ = create_publisher<geometry_msgs::msg::PointStamped>("~/marker_map_point", 10);
@@ -169,6 +173,12 @@ private:
     auto markers = detectMarkers(*detector_, img, has_id_filter_ ? &allowed_ids_ : nullptr);
     auto t1 = std::chrono::steady_clock::now();
 
+    // 이미지 발행 여부(config + 구독자). 발행 안 하면 그리기 자체를 건너뛴다 → 검출 풀스피드.
+    bool want_comp = publish_image_ && publish_compressed_ &&
+      pub_comp_->get_subscription_count() > 0;
+    bool want_raw = publish_image_ && publish_raw_ && pub_->get_subscription_count() > 0;
+    bool draw_needed = want_comp || want_raw;
+
     geometry_msgs::msg::PoseArray map_arr;
     map_arr.header.stamp = header.stamp;
     map_arr.header.frame_id = map_frame_;
@@ -186,14 +196,18 @@ private:
       }
       bool bad = have_pose && max_reproj_ > 0 && reproj > max_reproj_;
       cv::Scalar color = bad ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 0);
-      std::vector<cv::Point> poly(corners.begin(), corners.end());
-      std::vector<std::vector<cv::Point>> polys{poly};
-      cv::polylines(img, polys, true, color, 2);
+      if (draw_needed) {
+        std::vector<cv::Point> poly(corners.begin(), corners.end());
+        std::vector<std::vector<cv::Point>> polys{poly};
+        cv::polylines(img, polys, true, color, 2);
+      }
 
       cv::Point p0(cvRound(corners[0].x), cvRound(corners[0].y));
       std::string label = "id" + std::to_string(mid);
       if (have_pose && !bad) {
-        if (draw_axes_) {drawAxes(img, K, intr_.dist, rvec, tvec, marker_size_ * 0.5);}
+        if (draw_needed && draw_axes_) {
+          drawAxes(img, K, intr_.dist, rvec, tvec, marker_size_ * 0.5);
+        }
         double d_m = std::sqrt(tvec[0] * tvec[0] + tvec[1] * tvec[1] + tvec[2] * tvec[2]);
         char buf[32];
         if (draw_distance_) {
@@ -217,13 +231,15 @@ private:
       } else if (bad) {
         label += " (bad)";
       }
-      cv::putText(img, label, cv::Point(p0.x, p0.y - 10), cv::FONT_HERSHEY_SIMPLEX,
-        0.7, color, 2, cv::LINE_AA);
+      if (draw_needed) {
+        cv::putText(img, label, cv::Point(p0.x, p0.y - 10), cv::FONT_HERSHEY_SIMPLEX,
+          0.7, color, 2, cv::LINE_AA);
+      }
     }
 
     auto t2 = std::chrono::steady_clock::now();
-    // 구독자 있을 때만 발행(불필요한 직렬화/인코딩 회피).
-    if (pub_comp_->get_subscription_count() > 0) {
+    // config(publish_*) + 구독자 있을 때만 발행. 없으면 위에서 그리기도 스킵됨.
+    if (want_comp) {
       std::vector<unsigned char> buf;
       cv::imencode(".jpg", img, buf, {cv::IMWRITE_JPEG_QUALITY, jpeg_quality_});
       sensor_msgs::msg::CompressedImage cmsg;
@@ -232,7 +248,7 @@ private:
       cmsg.data = std::move(buf);
       pub_comp_->publish(cmsg);
     }
-    if (pub_->get_subscription_count() > 0) {
+    if (want_raw) {
       auto out = cv_bridge::CvImage(header, "bgr8", img).toImageMsg();
       pub_->publish(*out);
     }
@@ -298,6 +314,7 @@ private:
   tf2::Vector3 t_map_body_;
   double last_decode_ms_{0.0};
 
+  bool publish_image_{true}, publish_raw_{false}, publish_compressed_{true};
   int jpeg_quality_{80};
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_comp_;

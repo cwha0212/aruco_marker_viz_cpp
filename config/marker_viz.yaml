@@ -24,6 +24,13 @@
     draw_distance: true                  # 거리 텍스트 표시
     draw_axes: true                      # 좌표축 표시
 
+    # ── 이미지 발행 제어 (검출/pose 는 항상 발행, 아래는 시각화 이미지만) ──
+    # publish_image=false 면 그리기·발행 자체를 스킵 → 검출이 항상 풀스피드(도킹 시 권장).
+    publish_image: true                  # 시각화 이미지 발행 전체 스위치
+    publish_raw: false                   # 비압축 Image 발행(무거움, VNC 지연 원인) 기본 off
+    publish_compressed: true             # CompressedImage 발행(가벼움) 기본 on
+    jpeg_quality: 80                     # compressed 품질(1~100)
+
     # ── 마커 map 좌표 계산 (/aft_mapped_to_init 필요) ──
     odom_topic: /aft_mapped_to_init      # LIO 의 map 기준 바디 pose (nav_msgs/Odometry)
     map_frame: map
