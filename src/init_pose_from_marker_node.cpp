@@ -2,19 +2,15 @@
 // std_srvs/Trigger 호출 시 target_marker_id 마커를 인식할 때까지 탐색 → 평균 → 발행.
 //   init_pose(body in map) = T(map<-marker)[YAML] * inv( T(body<-cam)*T(cam<-marker) )
 //
-// ★ 검출은 반드시 '메인 스레드'에서 실행한다(marker_viz 와 동일). 이 커스텀 OpenCV
-//   빌드에서 detectMarkers 를 워커 스레드에서 돌리면 힙 손상이 나기 때문.
-//   구조: 이미지 콜백(default group)은 메인 스레드 실행기가, 서비스(별도 group)는
-//   별도 스레드 실행기가 spin. 서비스는 조건변수로 대기(블로킹), 이미지 콜백(메인
-//   스레드)이 마커를 인식하면 발행 후 서비스를 깨운다.
+// ★ 완전 단일 스레드(메인 스레드)로 동작한다. 이 커스텀 OpenCV 4.8 빌드는 검출을
+//   메인 스레드가 아닌 곳에서 돌리면 깨지므로(marker_viz 는 단일 스레드라 정상).
+//   서비스는 블로킹을 유지하되, 콜백 안에서 이미지 콜백그룹을 로컬 executor 로
+//   spin 해서 검출을 '메인 스레드'에서 처리한다(별도 스레드 없음).
 #include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
@@ -88,31 +84,34 @@ public:
 
     pub_init_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(init_topic, 10);
 
-    // 서비스는 별도 콜백그룹 → 별도 스레드 실행기(main() 에서 분배).
-    srv_cbg_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-
+    // 이미지/카메라인포는 '자동 등록 안 함' 콜백그룹에 둔다. 메인 executor 가 아니라
+    // 서비스 콜백 안에서 로컬로 spin 해서 검출을 메인 스레드에서 처리하기 위함.
+    img_cbg_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
+    rclcpp::SubscriptionOptions opts;
+    opts.callback_group = img_cbg_;
     auto qos = rclcpp::SensorDataQoS();
-    // 이미지/카메라인포는 default group → 메인 스레드 실행기가 처리(검출 메인 스레드).
     if (use_compressed_) {
       sub_cimg_ = create_subscription<sensor_msgs::msg::CompressedImage>(
-        image_topic_, qos, std::bind(&InitPoseNode::onCompressed, this, _1));
+        image_topic_, qos, std::bind(&InitPoseNode::onCompressed, this, _1), opts);
     } else {
       sub_img_ = create_subscription<sensor_msgs::msg::Image>(
-        image_topic_, qos, std::bind(&InitPoseNode::onRaw, this, _1));
+        image_topic_, qos, std::bind(&InitPoseNode::onRaw, this, _1), opts);
     }
     if (!intr_.ok) {
       sub_cinfo_ = create_subscription<sensor_msgs::msg::CameraInfo>(
-        cam_info_topic, qos, std::bind(&InitPoseNode::onCameraInfo, this, _1));
+        cam_info_topic, qos, std::bind(&InitPoseNode::onCameraInfo, this, _1), opts);
     }
+    // 서비스는 default group → 메인 rclcpp::spin 이 처리.
     srv_ = create_service<Trigger>(
-      "~/estimate_init_pose", std::bind(&InitPoseNode::onService, this, _1, _2),
-      rmw_qos_profile_services_default, srv_cbg_);
+      "~/estimate_init_pose", std::bind(&InitPoseNode::onService, this, _1, _2));
+
+    // 이미지 콜백그룹 전용 로컬 executor.
+    img_exec_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+    img_exec_->add_callback_group(img_cbg_, get_node_base_interface());
 
     RCLCPP_INFO(get_logger(), "init_pose_from_marker(C++) 시작 | in=%s initialpose->%s 캘리브=%s",
       image_topic_.c_str(), init_topic.c_str(), intr_.ok ? "ON" : "OFF");
   }
-
-  rclcpp::CallbackGroup::SharedPtr serviceCallbackGroup() {return srv_cbg_;}
 
 private:
   bool loadMarkerMap(const std::string & path)
@@ -155,10 +154,7 @@ private:
 
   void onCompressed(const sensor_msgs::msg::CompressedImage::SharedPtr msg)
   {
-    {
-      std::lock_guard<std::mutex> lk(m_);
-      if (!search_active_) {return;}
-    }
+    if (!search_active_) {return;}
     cv::Mat img;
     try {
       img = cv::imdecode(cv::Mat(msg->data), cv::IMREAD_COLOR);
@@ -171,10 +167,7 @@ private:
 
   void onRaw(const sensor_msgs::msg::Image::SharedPtr msg)
   {
-    {
-      std::lock_guard<std::mutex> lk(m_);
-      if (!search_active_) {return;}
-    }
+    if (!search_active_) {return;}
     try {
       processFrame(cv_bridge::toCvCopy(msg, "bgr8")->image);
     } catch (const std::exception & e) {
@@ -182,15 +175,10 @@ private:
     }
   }
 
-  // 메인 스레드에서 실행되는 검출 + 누적 + (충분하면) 발행.
-  void processFrame(cv::Mat img)
+  // 검출 + 누적 + (충분하면) 발행. (전부 메인 스레드에서 실행)
+  void processFrame(const cv::Mat & img)
   {
-    int target;
-    {
-      std::lock_guard<std::mutex> lk(m_);
-      if (!search_active_) {return;}
-      target = target_;
-    }
+    int target = search_target_;
     tf2::Vector3 pos;
     tf2::Quaternion quat;
     const char * step = "?";
@@ -229,35 +217,23 @@ private:
       return;
     }
 
-    tf2::Vector3 avg_pos;
-    tf2::Quaternion avg_q;
-    {
-      std::lock_guard<std::mutex> lk(m_);
-      if (!search_active_) {return;}
-      samples_pos_.push_back(pos);
-      samples_q_.push_back(quat);
-      if (static_cast<int64_t>(samples_pos_.size()) < num_samples_) {return;}
-      avg_pos = meanPos(samples_pos_);
-      avg_q = avgQuat(samples_q_);
-      search_active_ = false;
-    }
+    samples_pos_.push_back(pos);
+    samples_q_.push_back(quat);
+    if (static_cast<int64_t>(samples_pos_.size()) < num_samples_) {return;}
+
+    tf2::Vector3 avg_pos = meanPos(samples_pos_);
+    tf2::Quaternion avg_q = avgQuat(samples_q_);
     publishInitialPose(avg_pos, avg_q, now());
     auto rpy = matToRpyDeg(tf2::Matrix3x3(avg_q));
-    char buf[160];
-    std::snprintf(buf, sizeof(buf),
+    std::snprintf(result_msg_, sizeof(result_msg_),
       "id=%d 인식 -> init_pose 발행 pos=(%.3f, %.3f, %.3f) yaw=%.1fdeg (n=%ld)",
       target, avg_pos.x(), avg_pos.y(), avg_pos.z(), rpy[2], (long)num_samples_);
-    {
-      std::lock_guard<std::mutex> lk(m_);
-      result_success_ = true;
-      result_msg_ = buf;
-      done_ = true;
-    }
-    cv_.notify_all();
-    RCLCPP_INFO(get_logger(), "[service] %s", buf);
+    result_success_ = true;
+    search_active_ = false;  // 검색 종료(서비스 루프가 감지)
+    RCLCPP_INFO(get_logger(), "[service] %s", result_msg_);
   }
 
-  // 서비스 콜백(별도 스레드): 탐색 시작 → 조건변수로 대기 → 결과 반환.
+  // 서비스 콜백(메인 스레드): 탐색 시작 → 이미지 콜백그룹을 로컬 spin 하며 대기.
   void onService(
     const std::shared_ptr<Trigger::Request>, std::shared_ptr<Trigger::Response> resp)
   {
@@ -272,37 +248,24 @@ private:
       resp->message = "marker_map 에 id=" + std::to_string(target) + " 없음.";
       return;
     }
-    {
-      std::lock_guard<std::mutex> lk(m_);
-      if (search_active_) {
-        resp->success = false;
-        resp->message = "이미 다른 탐색이 진행 중입니다.";
-        return;
-      }
-      target_ = target;
-      samples_pos_.clear();
-      samples_q_.clear();
-      result_success_ = false;
-      result_msg_.clear();
-      done_ = false;
-      search_active_ = true;
-    }
+    search_target_ = target;
+    samples_pos_.clear();
+    samples_q_.clear();
+    result_success_ = false;
+    result_msg_[0] = '\0';
+    search_active_ = true;
     RCLCPP_INFO(get_logger(), "[service] id=%d 마커 탐색 시작(인식 시까지 대기)", target);
 
-    std::unique_lock<std::mutex> lk(m_);
-    bool got;
-    if (search_timeout_ > 0) {
-      got = cv_.wait_for(lk, std::chrono::duration<double>(search_timeout_),
-          [this] {return done_;});
-    } else {
-      cv_.wait(lk, [this] {return done_;});
-      got = true;
-    }
-    if (!got) {
-      search_active_ = false;
-      resp->success = false;
-      resp->message = "타임아웃: id=" + std::to_string(target) + " 마커 미인식.";
-      return;
+    auto t_start = now();
+    while (rclcpp::ok() && search_active_) {
+      // 이미지 콜백을 '이 스레드(메인)'에서 실행 → 검출이 메인 스레드에서 돎.
+      img_exec_->spin_once(std::chrono::milliseconds(100));
+      if (search_timeout_ > 0 && (now() - t_start).seconds() > search_timeout_) {
+        search_active_ = false;
+        resp->success = false;
+        resp->message = "타임아웃: id=" + std::to_string(target) + " 마커 미인식.";
+        return;
+      }
     }
     resp->success = result_success_;
     resp->message = result_msg_;
@@ -378,15 +341,15 @@ private:
   Extrinsic ext_;
   std::map<int, MarkerPose> marker_map_;
 
-  std::mutex m_;
-  std::condition_variable cv_;
-  bool search_active_{false}, done_{false}, result_success_{false};
-  int target_{1};
-  std::string result_msg_;
+  // 단일 스레드라 동기화 불필요.
+  bool search_active_{false}, result_success_{false};
+  int search_target_{1};
+  char result_msg_[160]{};
   std::vector<tf2::Vector3> samples_pos_;
   std::vector<tf2::Quaternion> samples_q_;
 
-  rclcpp::CallbackGroup::SharedPtr srv_cbg_;
+  rclcpp::CallbackGroup::SharedPtr img_cbg_;
+  rclcpp::executors::SingleThreadedExecutor::SharedPtr img_exec_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pub_init_;
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr sub_cimg_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_img_;
@@ -396,24 +359,8 @@ private:
 
 int main(int argc, char ** argv)
 {
-  // (주의) 이 커스텀 OpenCV 4.8 빌드에서 cv::setNumThreads(1) 은 aruco detectMarkers
-  // 를 깨뜨린다(setSize<0). 검출은 이미 메인 스레드에서만 도므로 호출하지 않는다.
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<InitPoseNode>();
-  auto base = node->get_node_base_interface();
-
-  // 서비스는 별도 스레드 실행기에서 (블로킹 대기).
-  rclcpp::executors::SingleThreadedExecutor srv_exec;
-  srv_exec.add_callback_group(node->serviceCallbackGroup(), base);
-  std::thread srv_thread([&srv_exec]() {srv_exec.spin();});
-
-  // 이미지/카메라인포(default group)는 메인 스레드 실행기에서 → 검출이 메인 스레드.
-  rclcpp::executors::SingleThreadedExecutor main_exec;
-  main_exec.add_callback_group(base->get_default_callback_group(), base);
-  main_exec.spin();
-
-  srv_exec.cancel();
-  if (srv_thread.joinable()) {srv_thread.join();}
+  rclcpp::spin(std::make_shared<InitPoseNode>());
   rclcpp::shutdown();
   return 0;
 }
