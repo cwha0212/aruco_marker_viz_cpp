@@ -168,30 +168,43 @@ private:
       if (!search_active_) {return;}
       target = target_;
     }
-    cv::Mat K = scaleK(intr_.K, intr_.calib_w, intr_.calib_h, img.cols, img.rows);
-    std::set<int> want{target};
-    auto markers = detectMarkers(*detector_, img, &want);
-    if (markers.empty()) {
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000, "id=%d 아직 미검출...", target);
-      return;
-    }
-    const auto & corners = markers[0].second;
-    cv::Vec3d rvec, tvec;
-    if (!cv::solvePnP(obj_pts_, corners, K, intr_.dist, rvec, tvec, false,
-      cv::SOLVEPNP_IPPE_SQUARE))
-    {
-      return;
-    }
-    double reproj = reprojectionError(obj_pts_, corners, rvec, tvec, K, intr_.dist);
-    if (max_reproj_ > 0 && reproj > max_reproj_) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "재투영오차 %.2fpx 초과 → 샘플 제외", reproj);
-      return;
-    }
-
+    if (img.empty() || !intr_.ok || intr_.K.empty() || intr_.dist.empty()) {return;}
     tf2::Vector3 pos;
     tf2::Quaternion quat;
-    robotPoseInMap(target, rvec, tvec, pos, quat);
+    const char * step = "?";
+    try {
+      step = "scaleK";
+      cv::Mat K = scaleK(intr_.K, intr_.calib_w, intr_.calib_h, img.cols, img.rows);
+      step = "detect";
+      std::set<int> want{target};
+      auto markers = detectMarkers(*detector_, img, &want);
+      if (markers.empty()) {
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000, "id=%d 아직 미검출...", target);
+        return;
+      }
+      const auto & corners = markers[0].second;
+      if (corners.size() != 4) {return;}
+      step = "solvePnP";
+      cv::Vec3d rvec, tvec;
+      if (!cv::solvePnP(obj_pts_, corners, K, intr_.dist, rvec, tvec, false,
+        cv::SOLVEPNP_IPPE_SQUARE))
+      {
+        return;
+      }
+      step = "reproj";
+      double reproj = reprojectionError(obj_pts_, corners, rvec, tvec, K, intr_.dist);
+      if (max_reproj_ > 0 && reproj > max_reproj_) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "재투영오차 %.2fpx 초과 → 샘플 제외", reproj);
+        return;
+      }
+      step = "robotPoseInMap";
+      robotPoseInMap(target, rvec, tvec, pos, quat);
+    } catch (const cv::Exception & e) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+        "process 예외 @%s: %s", step, e.what());
+      return;
+    }
 
     tf2::Vector3 avg_pos;
     tf2::Quaternion avg_q;
@@ -284,7 +297,7 @@ private:
     tf2::Matrix3x3 R_marker_body = R_body_marker.transpose();
     tf2::Vector3 t_marker_body = -(R_marker_body * t_body_marker);
 
-    const MarkerPose & mp = marker_map_[marker_id];
+    const MarkerPose & mp = marker_map_.at(marker_id);
     tf2::Matrix3x3 R_map_body = mp.R * R_marker_body;
     pos = mp.R * t_marker_body + mp.t;
     quat = matToQuat(R_map_body);
