@@ -396,7 +396,8 @@ private:
 
 int main(int argc, char ** argv)
 {
-  cv::setNumThreads(1);  // marker_viz 와 동일: OpenCV 내부 병렬처리 off.
+  // (주의) 이 커스텀 OpenCV 4.8 빌드에서 cv::setNumThreads(1) 은 aruco detectMarkers
+  // 를 깨뜨린다(setSize<0). 검출은 이미 메인 스레드에서만 도므로 호출하지 않는다.
   rclcpp::init(argc, argv);
   auto node = std::make_shared<InitPoseNode>();
   auto base = node->get_node_base_interface();
