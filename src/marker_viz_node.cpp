@@ -85,7 +85,11 @@ public:
     }
 
     auto qos = rclcpp::SensorDataQoS();
-    pub_ = create_publisher<sensor_msgs::msg::Image>(out_topic, 5);
+    // best-effort 로 발행(입력과 동일) → publish 논블로킹, 밀리면 최신만.
+    pub_ = create_publisher<sensor_msgs::msg::Image>(out_topic, qos);
+    pub_comp_ = create_publisher<sensor_msgs::msg::CompressedImage>(
+      out_topic + "/compressed", qos);
+    jpeg_quality_ = declare_parameter<int>("jpeg_quality", 80);
     pub_map_ = create_publisher<geometry_msgs::msg::PoseArray>("~/marker_map_poses", 10);
     pub_pt_ = create_publisher<geometry_msgs::msg::PointStamped>("~/marker_map_point", 10);
 
@@ -218,8 +222,20 @@ private:
     }
 
     auto t2 = std::chrono::steady_clock::now();
-    auto out = cv_bridge::CvImage(header, "bgr8", img).toImageMsg();
-    pub_->publish(*out);
+    // 구독자 있을 때만 발행(불필요한 직렬화/인코딩 회피).
+    if (pub_comp_->get_subscription_count() > 0) {
+      std::vector<unsigned char> buf;
+      cv::imencode(".jpg", img, buf, {cv::IMWRITE_JPEG_QUALITY, jpeg_quality_});
+      sensor_msgs::msg::CompressedImage cmsg;
+      cmsg.header = header;
+      cmsg.format = "jpeg";
+      cmsg.data = std::move(buf);
+      pub_comp_->publish(cmsg);
+    }
+    if (pub_->get_subscription_count() > 0) {
+      auto out = cv_bridge::CvImage(header, "bgr8", img).toImageMsg();
+      pub_->publish(*out);
+    }
     auto t3 = std::chrono::steady_clock::now();
     auto ms = [](auto a, auto b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
@@ -282,7 +298,9 @@ private:
   tf2::Vector3 t_map_body_;
   double last_decode_ms_{0.0};
 
+  int jpeg_quality_{80};
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_;
+  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_comp_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_map_;
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr pub_pt_;
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr sub_cimg_;
