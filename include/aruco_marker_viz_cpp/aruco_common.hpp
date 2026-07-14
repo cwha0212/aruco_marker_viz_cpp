@@ -105,12 +105,30 @@ struct MarkerDetector
   static cv::aruco::DetectorParameters makeParams()
   {
     cv::aruco::DetectorParameters p;
+    // ★ 모든 필드를 명시적으로 설정한다. 이 커스텀 OpenCV 4.8 빌드에서 기본생성자가
+    //   일부 필드를 초기화하지 않으면(쓰레기값) detectMarkers 내부 크기 계산이 음수가
+    //   되어 setSize<0 로 죽는다(노드별 메모리 배치에 따라 재현). 명시 설정으로 제거.
+    p.adaptiveThreshWinSizeMin = 3;
+    p.adaptiveThreshWinSizeMax = 23;
+    p.adaptiveThreshWinSizeStep = 10;
+    p.adaptiveThreshConstant = 7.0;
+    p.minMarkerPerimeterRate = 0.03;
+    p.maxMarkerPerimeterRate = 4.0;
+    p.polygonalApproxAccuracyRate = 0.03;
+    p.minCornerDistanceRate = 0.05;
+    p.minDistanceToBorder = 3;
+    p.minMarkerDistanceRate = 0.05;
     p.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
     p.cornerRefinementWinSize = 5;
     p.cornerRefinementMaxIterations = 50;
     p.cornerRefinementMinAccuracy = 0.01;
-    p.errorCorrectionRate = 0.4;
+    p.markerBorderBits = 1;
+    p.perspectiveRemovePixelPerCell = 4;
+    p.perspectiveRemoveIgnoredMarginPerCell = 0.13;
     p.maxErroneousBitsInBorderRate = 0.2;
+    p.minOtsuStdDev = 5.0;
+    p.errorCorrectionRate = 0.4;
+    p.detectInvertedMarker = false;
     return p;
   }
   void detect(
