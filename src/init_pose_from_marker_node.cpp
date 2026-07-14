@@ -3,18 +3,21 @@
 //   init_pose(body in map) = T(map<-marker)[YAML] * inv( T(body<-cam)*T(cam<-marker) )
 //
 // ★ 검출은 반드시 '메인 스레드'에서 실행한다(marker_viz 와 동일). 이 커스텀 OpenCV
-//   빌드에서 detectMarkers 를 실행기 워커 스레드에서 돌리면 힙 손상이 나기 때문에,
-//   MultiThreadedExecutor 대신 단일 스레드 spin + 서비스 콜백 내부에서 wait_for_message
-//   로 직접 이미지를 받아 처리한다(서비스는 마커 인식까지 블로킹).
+//   빌드에서 detectMarkers 를 워커 스레드에서 돌리면 힙 손상이 나기 때문.
+//   구조: 이미지 콜백(default group)은 메인 스레드 실행기가, 서비스(별도 group)는
+//   별도 스레드 실행기가 spin. 서비스는 조건변수로 대기(블로킹), 이미지 콜백(메인
+//   스레드)이 마커를 인식하면 발행 후 서비스를 깨운다.
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
-#include <rclcpp/wait_for_message.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -27,7 +30,6 @@
 using namespace aruco_common;
 using std::placeholders::_1;
 using std::placeholders::_2;
-using namespace std::chrono_literals;
 using Trigger = std_srvs::srv::Trigger;
 
 struct MarkerPose
@@ -86,29 +88,31 @@ public:
 
     pub_init_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(init_topic, 10);
 
+    // 서비스는 별도 콜백그룹 → 별도 스레드 실행기(main() 에서 분배).
+    srv_cbg_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
     auto qos = rclcpp::SensorDataQoS();
-    // 이미지 구독: 실제 취득은 서비스 콜백의 wait_for_message 가 직접 한다.
-    // 실행기 waitset 과 충돌하지 않도록 '자동 등록 안 함' 콜백그룹에 둔다.
-    img_cbg_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
-    rclcpp::SubscriptionOptions opts;
-    opts.callback_group = img_cbg_;
+    // 이미지/카메라인포는 default group → 메인 스레드 실행기가 처리(검출 메인 스레드).
     if (use_compressed_) {
       sub_cimg_ = create_subscription<sensor_msgs::msg::CompressedImage>(
-        image_topic_, qos, [](sensor_msgs::msg::CompressedImage::SharedPtr) {}, opts);
+        image_topic_, qos, std::bind(&InitPoseNode::onCompressed, this, _1));
     } else {
       sub_img_ = create_subscription<sensor_msgs::msg::Image>(
-        image_topic_, qos, [](sensor_msgs::msg::Image::SharedPtr) {}, opts);
+        image_topic_, qos, std::bind(&InitPoseNode::onRaw, this, _1));
     }
     if (!intr_.ok) {
       sub_cinfo_ = create_subscription<sensor_msgs::msg::CameraInfo>(
         cam_info_topic, qos, std::bind(&InitPoseNode::onCameraInfo, this, _1));
     }
     srv_ = create_service<Trigger>(
-      "~/estimate_init_pose", std::bind(&InitPoseNode::onService, this, _1, _2));
+      "~/estimate_init_pose", std::bind(&InitPoseNode::onService, this, _1, _2),
+      rmw_qos_profile_services_default, srv_cbg_);
 
     RCLCPP_INFO(get_logger(), "init_pose_from_marker(C++) 시작 | in=%s initialpose->%s 캘리브=%s",
       image_topic_.c_str(), init_topic.c_str(), intr_.ok ? "ON" : "OFF");
   }
+
+  rclcpp::CallbackGroup::SharedPtr serviceCallbackGroup() {return srv_cbg_;}
 
 private:
   bool loadMarkerMap(const std::string & path)
@@ -149,56 +153,111 @@ private:
     RCLCPP_INFO(get_logger(), "CameraInfo 수신 → 캘리브 활성화.");
   }
 
-  // wait_for_message 로 다음 이미지 1장을 받아 cv::Mat 으로. (메인 스레드에서 호출)
-  bool grabImage(cv::Mat & img)
+  void onCompressed(const sensor_msgs::msg::CompressedImage::SharedPtr msg)
   {
-    auto ctx = get_node_options().context();
-    if (use_compressed_) {
-      sensor_msgs::msg::CompressedImage msg;
-      if (!rclcpp::wait_for_message(msg, sub_cimg_, ctx, 1s)) {return false;}
-      img = cv::imdecode(cv::Mat(msg.data), cv::IMREAD_COLOR);
-    } else {
-      sensor_msgs::msg::Image msg;
-      if (!rclcpp::wait_for_message(msg, sub_img_, ctx, 1s)) {return false;}
-      try {
-        img = cv_bridge::toCvCopy(msg, "bgr8")->image;
-      } catch (const std::exception & e) {
-        RCLCPP_ERROR(get_logger(), "이미지 변환 실패: %s", e.what());
-        return false;
-      }
-    }
-    return !img.empty();
-  }
-
-  // 대상 마커 검출 + 로봇 map pose 계산. 못 찾거나 게이팅 탈락이면 false. (메인 스레드)
-  bool tryDetect(cv::Mat & img, int target, tf2::Vector3 & pos, tf2::Quaternion & quat)
-  {
-    if (img.empty() || !intr_.ok || intr_.K.empty() || intr_.dist.empty()) {return false;}
-    cv::Mat K = scaleK(intr_.K, intr_.calib_w, intr_.calib_h, img.cols, img.rows);
-    std::set<int> want{target};
-    auto markers = detectMarkers(*detector_, img, &want);
-    if (markers.empty()) {
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000, "id=%d 아직 미검출...", target);
-      return false;
-    }
-    const auto & corners = markers[0].second;
-    if (corners.size() != 4) {return false;}
-    cv::Vec3d rvec, tvec;
-    if (!cv::solvePnP(obj_pts_, corners, K, intr_.dist, rvec, tvec, false,
-      cv::SOLVEPNP_IPPE_SQUARE))
     {
-      return false;
+      std::lock_guard<std::mutex> lk(m_);
+      if (!search_active_) {return;}
     }
-    double reproj = reprojectionError(obj_pts_, corners, rvec, tvec, K, intr_.dist);
-    if (max_reproj_ > 0 && reproj > max_reproj_) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "재투영오차 %.2fpx 초과 → 샘플 제외", reproj);
-      return false;
+    cv::Mat img;
+    try {
+      img = cv::imdecode(cv::Mat(msg->data), cv::IMREAD_COLOR);
+    } catch (const cv::Exception & e) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000, "imdecode 예외: %s", e.what());
+      return;
     }
-    robotPoseInMap(target, rvec, tvec, pos, quat);
-    return true;
+    if (!img.empty()) {processFrame(img);}
   }
 
+  void onRaw(const sensor_msgs::msg::Image::SharedPtr msg)
+  {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (!search_active_) {return;}
+    }
+    try {
+      processFrame(cv_bridge::toCvCopy(msg, "bgr8")->image);
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000, "이미지 변환 실패: %s", e.what());
+    }
+  }
+
+  // 메인 스레드에서 실행되는 검출 + 누적 + (충분하면) 발행.
+  void processFrame(cv::Mat img)
+  {
+    int target;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (!search_active_) {return;}
+      target = target_;
+    }
+    tf2::Vector3 pos;
+    tf2::Quaternion quat;
+    const char * step = "?";
+    try {
+      if (img.empty() || !intr_.ok || intr_.K.empty() || intr_.dist.empty()) {return;}
+      step = "scaleK";
+      cv::Mat K = scaleK(intr_.K, intr_.calib_w, intr_.calib_h, img.cols, img.rows);
+      step = "detect";
+      std::set<int> want{target};
+      auto markers = detectMarkers(*detector_, img, &want);
+      if (markers.empty()) {
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000, "id=%d 아직 미검출...", target);
+        return;
+      }
+      const auto & corners = markers[0].second;
+      if (corners.size() != 4) {return;}
+      step = "solvePnP";
+      cv::Vec3d rvec, tvec;
+      if (!cv::solvePnP(obj_pts_, corners, K, intr_.dist, rvec, tvec, false,
+        cv::SOLVEPNP_IPPE_SQUARE))
+      {
+        return;
+      }
+      step = "reproj";
+      double reproj = reprojectionError(obj_pts_, corners, rvec, tvec, K, intr_.dist);
+      if (max_reproj_ > 0 && reproj > max_reproj_) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "재투영오차 %.2fpx 초과 → 샘플 제외", reproj);
+        return;
+      }
+      step = "robotPoseInMap";
+      robotPoseInMap(target, rvec, tvec, pos, quat);
+    } catch (const cv::Exception & e) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+        "processFrame 예외 @%s: %s", step, e.what());
+      return;
+    }
+
+    tf2::Vector3 avg_pos;
+    tf2::Quaternion avg_q;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (!search_active_) {return;}
+      samples_pos_.push_back(pos);
+      samples_q_.push_back(quat);
+      if (static_cast<int64_t>(samples_pos_.size()) < num_samples_) {return;}
+      avg_pos = meanPos(samples_pos_);
+      avg_q = avgQuat(samples_q_);
+      search_active_ = false;
+    }
+    publishInitialPose(avg_pos, avg_q, now());
+    auto rpy = matToRpyDeg(tf2::Matrix3x3(avg_q));
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+      "id=%d 인식 -> init_pose 발행 pos=(%.3f, %.3f, %.3f) yaw=%.1fdeg (n=%ld)",
+      target, avg_pos.x(), avg_pos.y(), avg_pos.z(), rpy[2], (long)num_samples_);
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      result_success_ = true;
+      result_msg_ = buf;
+      done_ = true;
+    }
+    cv_.notify_all();
+    RCLCPP_INFO(get_logger(), "[service] %s", buf);
+  }
+
+  // 서비스 콜백(별도 스레드): 탐색 시작 → 조건변수로 대기 → 결과 반환.
   void onService(
     const std::shared_ptr<Trigger::Request>, std::shared_ptr<Trigger::Response> resp)
   {
@@ -213,43 +272,40 @@ private:
       resp->message = "marker_map 에 id=" + std::to_string(target) + " 없음.";
       return;
     }
-    RCLCPP_INFO(get_logger(), "[service] id=%d 마커 탐색 시작(인식 시까지 대기)", target);
-
-    std::vector<tf2::Vector3> spos;
-    std::vector<tf2::Quaternion> squat;
-    auto t_start = now();
-    while (rclcpp::ok()) {
-      cv::Mat img;
-      if (grabImage(img)) {
-        tf2::Vector3 pos;
-        tf2::Quaternion quat;
-        if (tryDetect(img, target, pos, quat)) {
-          spos.push_back(pos);
-          squat.push_back(quat);
-          if (static_cast<int64_t>(spos.size()) >= num_samples_) {
-            tf2::Vector3 avg_pos = meanPos(spos);
-            tf2::Quaternion avg_q = avgQuat(squat);
-            publishInitialPose(avg_pos, avg_q, now());
-            auto rpy = matToRpyDeg(tf2::Matrix3x3(avg_q));
-            char buf[160];
-            std::snprintf(buf, sizeof(buf),
-              "id=%d 인식 -> init_pose 발행 pos=(%.3f, %.3f, %.3f) yaw=%.1fdeg (n=%ld)",
-              target, avg_pos.x(), avg_pos.y(), avg_pos.z(), rpy[2], (long)num_samples_);
-            resp->success = true;
-            resp->message = buf;
-            RCLCPP_INFO(get_logger(), "[service] %s", buf);
-            return;
-          }
-        }
-      }
-      if (search_timeout_ > 0 && (now() - t_start).seconds() > search_timeout_) {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (search_active_) {
         resp->success = false;
-        resp->message = "타임아웃: id=" + std::to_string(target) + " 마커 미인식.";
+        resp->message = "이미 다른 탐색이 진행 중입니다.";
         return;
       }
+      target_ = target;
+      samples_pos_.clear();
+      samples_q_.clear();
+      result_success_ = false;
+      result_msg_.clear();
+      done_ = false;
+      search_active_ = true;
     }
-    resp->success = false;
-    resp->message = "노드 종료됨.";
+    RCLCPP_INFO(get_logger(), "[service] id=%d 마커 탐색 시작(인식 시까지 대기)", target);
+
+    std::unique_lock<std::mutex> lk(m_);
+    bool got;
+    if (search_timeout_ > 0) {
+      got = cv_.wait_for(lk, std::chrono::duration<double>(search_timeout_),
+          [this] {return done_;});
+    } else {
+      cv_.wait(lk, [this] {return done_;});
+      got = true;
+    }
+    if (!got) {
+      search_active_ = false;
+      resp->success = false;
+      resp->message = "타임아웃: id=" + std::to_string(target) + " 마커 미인식.";
+      return;
+    }
+    resp->success = result_success_;
+    resp->message = result_msg_;
   }
 
   void robotPoseInMap(
@@ -291,8 +347,7 @@ private:
   }
 
   void publishInitialPose(
-    const tf2::Vector3 & pos, const tf2::Quaternion & q,
-    const rclcpp::Time & stamp)
+    const tf2::Vector3 & pos, const tf2::Quaternion & q, const rclcpp::Time & stamp)
   {
     geometry_msgs::msg::PoseWithCovarianceStamped msg;
     msg.header.stamp = stamp;
@@ -323,7 +378,15 @@ private:
   Extrinsic ext_;
   std::map<int, MarkerPose> marker_map_;
 
-  rclcpp::CallbackGroup::SharedPtr img_cbg_;
+  std::mutex m_;
+  std::condition_variable cv_;
+  bool search_active_{false}, done_{false}, result_success_{false};
+  int target_{1};
+  std::string result_msg_;
+  std::vector<tf2::Vector3> samples_pos_;
+  std::vector<tf2::Quaternion> samples_q_;
+
+  rclcpp::CallbackGroup::SharedPtr srv_cbg_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pub_init_;
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr sub_cimg_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_img_;
@@ -333,10 +396,23 @@ private:
 
 int main(int argc, char ** argv)
 {
-  // marker_viz 와 동일: OpenCV 내부 병렬처리 off + 단일 스레드(검출은 메인 스레드).
-  cv::setNumThreads(1);
+  cv::setNumThreads(1);  // marker_viz 와 동일: OpenCV 내부 병렬처리 off.
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<InitPoseNode>());
+  auto node = std::make_shared<InitPoseNode>();
+  auto base = node->get_node_base_interface();
+
+  // 서비스는 별도 스레드 실행기에서 (블로킹 대기).
+  rclcpp::executors::SingleThreadedExecutor srv_exec;
+  srv_exec.add_callback_group(node->serviceCallbackGroup(), base);
+  std::thread srv_thread([&srv_exec]() {srv_exec.spin();});
+
+  // 이미지/카메라인포(default group)는 메인 스레드 실행기에서 → 검출이 메인 스레드.
+  rclcpp::executors::SingleThreadedExecutor main_exec;
+  main_exec.add_callback_group(base->get_default_callback_group(), base);
+  main_exec.spin();
+
+  srv_exec.cancel();
+  if (srv_thread.joinable()) {srv_thread.join();}
   rclcpp::shutdown();
   return 0;
 }
