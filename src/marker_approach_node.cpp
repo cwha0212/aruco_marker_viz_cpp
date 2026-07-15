@@ -204,7 +204,8 @@ public:
   }
 
 private:
-  enum class State { IDLE, CENTER, ALIGN, APPROACH, OPENLOOP, ARRIVED };
+  // 정렬 순서: CENTER(y 거친) → YAW(yaw만) → FINE(y 미세) → APPROACH(전진)
+  enum class State { IDLE, CENTER, YAW, FINE, APPROACH, OPENLOOP, ARRIVED };
 
   void onOdom(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
@@ -591,27 +592,33 @@ private:
       return;
     }
 
-    // 폐루프 제어. CENTER: y축만 → ALIGN: y+yaw → APPROACH: x+y+yaw
+    // 폐루프 제어: 축을 순차 분리. CENTER(y거친) → YAW(yaw만) → FINE(y미세) → APPROACH(x+보정)
     double vx = 0.0, vy = 0.0, wz = 0.0;
     bool center_ok = std::abs(f_center_) < lat_tol_;
     bool axis_ok = std::abs(f_axis_) < yaw_tol_;
 
-    if (state_ == State::CENTER) {
-      // 1차: y축 이동으로만 대략 중앙에 맞춘 뒤 yaw 투입(먼 거리 + 큰 yaw에서 틀어짐 방지).
+    if (state_ == State::CENTER) {          // 1) y축 거친 정렬 (vy만)
       if (std::abs(f_center_) >= center_first_tol_) {
         vy = kp_lat_ * f_center_;
       } else {
-        state_ = State::ALIGN;
-        RCLCPP_INFO(get_logger(), "1차 중앙정렬 완료 → ALIGN(y+yaw)");
+        state_ = State::YAW;
+        RCLCPP_INFO(get_logger(), "1차 중앙정렬 완료 → YAW(정면 회전)");
       }
-    } else if (state_ == State::ALIGN) {
-      if (!center_ok) {vy = kp_lat_ * f_center_;}
-      if (!axis_ok) {wz = kp_yaw_ * f_axis_;}
-      if (center_ok && axis_ok) {
+    } else if (state_ == State::YAW) {       // 2) yaw 정렬 (wz만)
+      if (!axis_ok) {
+        wz = kp_yaw_ * f_axis_;
+      } else {
+        state_ = State::FINE;
+        RCLCPP_INFO(get_logger(), "yaw 정렬 완료 → FINE(y 미세정렬)");
+      }
+    } else if (state_ == State::FINE) {       // 3) y축 미세 정렬 (vy만; yaw로 틀어진 중앙 보정)
+      if (!center_ok) {
+        vy = kp_lat_ * f_center_;
+      } else {
         state_ = State::APPROACH;
-        RCLCPP_INFO(get_logger(), "정면 정렬 완료 → APPROACH (z=%.3fm)", f_z_);
+        RCLCPP_INFO(get_logger(), "미세 중앙정렬 완료 → APPROACH (z=%.3fm)", f_z_);
       }
-    } else {  // APPROACH
+    } else {  // 4) APPROACH (전진 + 정렬 유지 보정)
       if (std::abs(f_z_ - final_distance_) < dist_tol_) {
         publishStop(); state_ = State::ARRIVED;
         RCLCPP_INFO(get_logger(), "도착 완료(ARRIVED): z=%.3fm (목표 %.3fm)", f_z_, final_distance_);
@@ -624,7 +631,7 @@ private:
 
     publishSmoothed(vx, vy, wz, dt);
     const char * sn = state_ == State::CENTER ? "CENTER" :
-      (state_ == State::ALIGN ? "ALIGN" : "APPROACH");
+      (state_ == State::YAW ? "YAW" : (state_ == State::FINE ? "FINE" : "APPROACH"));
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
       "[%s] z=%.3f e_center=%.3f e_axis=%.1fdeg | cmd v=(%.2f,%.2f) w=%.2f",
       sn, f_z_, f_center_, rad2deg(f_axis_), last_vx_, last_vy_, last_wz_);

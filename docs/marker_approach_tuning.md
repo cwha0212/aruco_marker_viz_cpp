@@ -8,14 +8,16 @@
 ## 1. 동작 개요
 
 ```
-IDLE ─(~/start)▶ CENTER ─(y축 대략 정렬)▶ ALIGN ─(중앙+z축 정렬)▶ APPROACH ─(z=final)▶ ARRIVED
-                                                                     │
-                              마커 소실 시 정지(근접이면 OPENLOOP) ◀──┘
+IDLE ─start▶ CENTER ─|e_center|<center_first_tol▶ YAW ─|e_axis|<yaw_tol▶ FINE ─|e_center|<lat_tol▶ APPROACH ─z=final▶ ARRIVED
+                                                                                        │
+                                                     마커 소실 시 정지(근접이면 OPENLOOP) ◀┘
 ```
 
-- **CENTER**: (신규) `vy`만으로 먼저 마커를 화면 중앙에 대략(`center_first_tolerance`) 맞춘다.
-  먼 거리 + 큰 yaw에서 yaw를 먼저 돌리다 틀어지는 것을 막기 위해 **yaw는 아직 안 씀**.
-- **ALIGN**: 전진 없이 `vy`(횡이동)로 중앙을, `wz`(yaw)로 마커 정면(z축)을 함께 맞춘다.
+정렬은 **축을 순차 분리**한다(각 단계 전진 없음, 해당 축만):
+- **CENTER**: `vy`만으로 마커를 화면 중앙에 **거칠게**(`center_first_tolerance`) 맞춤. yaw 아직 안 씀.
+- **YAW**: `wz`만으로 마커 정면(z축) 정렬(`yaw_tolerance_deg`). 회전하면 중앙이 조금 틀어짐 → 다음 단계에서 보정.
+- **FINE**: `vy`만으로 중앙을 **미세**(`lateral_tolerance`) 재정렬(yaw로 틀어진 중앙 복구).
+- **APPROACH**: 전진 `vx` + 정렬 유지 보정(`vy`,`wz` 데드밴드).
 - **APPROACH**: 정면을 유지한 채 `vx`로 전진, **카메라 z거리(`tvec[2]`)가 `final_distance`** 가 되면 정지.
 - **OPENLOOP**: 마커가 너무 가까워 화면을 벗어나면(=근접 소실), 마지막 남은 거리를 무피드백 저속 직진으로 마무리(odom 이동거리 or 시간 기반).
 
