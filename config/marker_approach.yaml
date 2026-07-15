@@ -1,0 +1,53 @@
+/marker_approach:
+  ros__parameters:
+    # === 검출/캘리브 (marker_viz.yaml 과 동일 값) ===
+    image_topic: /camera/image_raw/compressed
+    use_compressed: true
+    camera_info_topic: /camera/camera_info
+    calib_file: ''
+    fx: 693.63719436
+    fy: 696.14717994
+    cx: 623.66167469
+    cy: 330.68319062
+    dist_coeffs: [-0.3001462, 0.07451067, -0.00028039, 0.00027014, 0.0]
+    calib_resolution: [1280, 720]
+    aruco_dict: DICT_4X4_50
+    marker_size: 0.185
+    target_marker_id: 1        # 접근할 마커 ID
+    max_reproj_error: 4.0
+
+    # === 외부파라미터 (카메라 장착; marker_viz.yaml 과 동일) ===
+    lidar_mount_rpy_deg: [0.0, 0.0, 0.0]
+    cam_mount_xyz: [0.0, 0.0, -0.17]
+    cam_mount_rpy_deg: [0.0, 0.0, 0.0]
+
+    # === 접근 제어 ===
+    cmd_vel_topic: /cmd_vel     # 속도명령(geometry_msgs/Twist) 발행 토픽
+    auto_start: false           # true=실행 즉시 접근, false=~/start 호출까지 대기(안전)
+    control_rate_hz: 20.0       # 제어/발행 주기 [Hz]
+    max_pose_age_sec: 0.5       # 관측이 이보다 오래되면 마커 소실로 보고 정지 [s]
+    final_distance: 0.10        # 최종 정지 목표(카메라 z거리) [m] = 10cm
+    max_linear_speed: 0.3       # 선속도(vx,vy 합성) 상한 [m/s]
+    max_yaw_rate: 0.6           # 각속도 상한 [rad/s]
+    max_linear_accel: 0.5       # 선속도 slew(가속) 제한 [m/s^2] — 부드러움
+    max_yaw_accel: 1.0          # 각속도 slew(가속) 제한 [rad/s^2]
+    min_linear_speed: 0.02      # 데드밴드: 이보다 작은 선속도는 0 [m/s]
+    kp_forward: 0.8             # 전진 P게인: vx = kp_forward*(z_cam - final_distance)
+    kp_lateral: 1.0            # 중앙정렬 P게인: vy = kp_lateral*e_center
+    kp_yaw: 1.2                # z축 정렬 P게인: wz = kp_yaw*e_axis
+    distance_tolerance: 0.02    # 도착 판정: |z_cam - final_distance| < 이 값 [m]
+    lateral_tolerance: 0.03     # ALIGN 완료: |e_center| < 이 값 [m]
+    yaw_tolerance_deg: 5.0      # ALIGN 완료(z축 정렬 허용오차): |e_axis| < 이 값 [deg]
+
+    # === 관측 필터 ===
+    obs_filter_alpha: 0.5       # 관측 EMA 계수(0~1). 클수록 반응↑/노이즈↑, 작을수록 부드럽↑/지연↑
+
+    # === 근접 소실 대비 열린루프 마무리 (마커가 화면 벗어나는 최종구간) ===
+    openloop_final_approach: true   # 근접 소실 시 마지막 구간 무피드백 직진으로 마무리
+    openloop_enter_distance: 0.35   # 이 거리 이내에서 소실해야 열린루프 진입 [m]
+    openloop_speed: 0.1             # 열린루프 직진 속도 [m/s]
+    openloop_max_distance: 0.3      # 열린루프 최대 직진 거리(오검출 폭주 방지) [m]
+
+    # === odom (열린루프 진행거리 측정에만 사용) ===
+    use_odom: true              # true면 odom으로 열린루프 이동거리 측정(더 정확), false면 시간기반
+    odom_topic: /aft_mapped_to_init

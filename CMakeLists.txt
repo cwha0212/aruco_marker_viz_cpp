@@ -34,7 +34,11 @@ add_executable(init_pose_from_marker_node src/init_pose_from_marker_node.cpp)
 ament_target_dependencies(init_pose_from_marker_node ${DEPS})
 target_link_libraries(init_pose_from_marker_node ${OpenCV_LIBS} yaml-cpp)
 
-install(TARGETS marker_viz_node init_pose_from_marker_node
+add_executable(marker_approach_node src/marker_approach_node.cpp)
+ament_target_dependencies(marker_approach_node ${DEPS})
+target_link_libraries(marker_approach_node ${OpenCV_LIBS} yaml-cpp)
+
+install(TARGETS marker_viz_node init_pose_from_marker_node marker_approach_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch config
