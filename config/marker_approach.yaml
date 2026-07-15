@@ -26,18 +26,22 @@
     auto_start: false           # true=실행 즉시 접근, false=~/start 호출까지 대기(안전)
     control_rate_hz: 20.0       # 제어/발행 주기 [Hz]
     max_pose_age_sec: 0.5       # 관측이 이보다 오래되면 마커 소실로 보고 정지 [s]
-    final_distance: 0.10        # 최종 정지 목표(카메라 z거리) [m] = 10cm
-    max_linear_speed: 0.3       # 선속도(vx,vy 합성) 상한 [m/s]
+    final_distance: 0.25        # 최종 정지 목표(카메라 z거리) [m]
+    max_linear_speed: 0.15      # 선속도(vx,vy 합성) 상한 [m/s]
     max_yaw_rate: 0.6           # 각속도 상한 [rad/s]
     max_linear_accel: 0.5       # 선속도 slew(가속) 제한 [m/s^2] — 부드러움
     max_yaw_accel: 1.0          # 각속도 slew(가속) 제한 [rad/s^2]
-    min_linear_speed: 0.02      # 데드밴드: 이보다 작은 선속도는 0 [m/s]
+    # 하드웨어 축별 최소속도(데드존 하한). |명령|이 이보다 작으면 로봇 무시 → 이 값까지 끌어올림.
+    min_vx: 0.05                # vx ∈ [0.05, 3.0]
+    min_vy: 0.1                 # vy ∈ [0.1, 1.0]
+    min_yaw_rate: 0.02          # yaw ∈ [0.02, 3.0]
+    center_first_tolerance: 0.05  # CENTER 단계: |e_center|<이 값이면 yaw 투입(ALIGN)으로 전환
     kp_forward: 0.8             # 전진 P게인: vx = kp_forward*(z_cam - final_distance)
-    kp_lateral: 1.0            # 중앙정렬 P게인: vy = kp_lateral*e_center
+    kp_lateral: 1.5            # 중앙정렬 P게인: vy = kp_lateral*e_center (↑=더 확실히)
     kp_yaw: 1.2                # z축 정렬 P게인: wz = kp_yaw*e_axis
-    distance_tolerance: 0.02    # 도착 판정: |z_cam - final_distance| < 이 값 [m]
-    lateral_tolerance: 0.03     # ALIGN 완료: |e_center| < 이 값 [m]
-    yaw_tolerance_deg: 5.0      # ALIGN 완료(z축 정렬 허용오차): |e_axis| < 이 값 [deg]
+    distance_tolerance: 0.03    # 도착 판정: |z_cam - final_distance| < 이 값 [m]
+    lateral_tolerance: 0.025    # ALIGN 완료: |e_center| < 이 값 [m]
+    yaw_tolerance_deg: 4.0      # ALIGN 완료(z축 정렬 허용오차): |e_axis| < 이 값 [deg]
 
     # === 관측 필터 ===
     obs_filter_alpha: 0.5       # 관측 EMA 계수(0~1). 클수록 반응↑/노이즈↑, 작을수록 부드럽↑/지연↑

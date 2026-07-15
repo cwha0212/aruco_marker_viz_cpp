@@ -175,7 +175,10 @@ public:
     max_yaw_ = declare_parameter<double>("max_yaw_rate", 0.6);
     max_lin_acc_ = declare_parameter<double>("max_linear_accel", 0.5);
     max_yaw_acc_ = declare_parameter<double>("max_yaw_accel", 1.0);
-    min_lin_ = declare_parameter<double>("min_linear_speed", 0.02);
+    min_vx_ = declare_parameter<double>("min_vx", 0.05);       // 하드웨어 vx 데드존 하한
+    min_vy_ = declare_parameter<double>("min_vy", 0.1);        // 하드웨어 vy 데드존 하한
+    min_wz_ = declare_parameter<double>("min_yaw_rate", 0.02);  // 하드웨어 yaw 데드존 하한
+    center_first_tol_ = declare_parameter<double>("center_first_tolerance", 0.05);
     kp_fwd_ = declare_parameter<double>("kp_forward", 0.8);
     kp_lat_ = declare_parameter<double>("kp_lateral", 1.0);
     kp_yaw_ = declare_parameter<double>("kp_yaw", 1.2);
@@ -192,7 +195,7 @@ public:
       "~/start", std::bind(&MarkerApproachNode::onStart, this, _1, _2));
     srv_stop_ = create_service<Trigger>(
       "~/stop", std::bind(&MarkerApproachNode::onStop, this, _1, _2));
-    if (auto_start_) {state_ = State::ALIGN;}
+    if (auto_start_) {state_ = State::CENTER;}
 
     RCLCPP_INFO(get_logger(),
       "marker_approach(C++) 시작 | in=%s cmd->%s 캘리브=%s target_id=%d 자동시작=%s",
@@ -201,7 +204,7 @@ public:
   }
 
 private:
-  enum class State { IDLE, ALIGN, APPROACH, OPENLOOP, ARRIVED };
+  enum class State { IDLE, CENTER, ALIGN, APPROACH, OPENLOOP, ARRIVED };
 
   void onOdom(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
@@ -311,15 +314,10 @@ private:
         tf2::Matrix3x3 R_map_marker;
         if (markerPoseInMap(rvec, tvec, pose, R_map_marker)) {
           map_arr.poses.push_back(pose);
-          auto rpy = matToRpyDeg(R_map_marker);
           char mb[48];
           std::snprintf(mb, sizeof(mb), " map(%.2f,%.2f,%.2f)",
             pose.position.x, pose.position.y, pose.position.z);
           label += mb;
-          RCLCPP_INFO(get_logger(),
-            "[id=%d] cam dist=%.3fm -> map position=(%.3f, %.3f, %.3f) "
-            "orientation_rpy_deg=(%.1f, %.1f, %.1f)", mid, d_m,
-            pose.position.x, pose.position.y, pose.position.z, rpy[0], rpy[1], rpy[2]);
         }
       } else if (bad) {
         label += " (bad)";
@@ -520,9 +518,9 @@ private:
       resp->success = false; resp->message = "카메라 캘리브레이션이 없어 접근 불가.";
       return;
     }
-    state_ = State::ALIGN; have_prev_ = false;
-    resp->success = true; resp->message = "접근 시작(ALIGN).";
-    RCLCPP_INFO(get_logger(), "[approach] 시작 → ALIGN");
+    state_ = State::CENTER; have_prev_ = false;
+    resp->success = true; resp->message = "접근 시작(CENTER).";
+    RCLCPP_INFO(get_logger(), "[approach] 시작 → CENTER(1차 중앙정렬)");
   }
 
   void onStop(const std::shared_ptr<Trigger::Request>, std::shared_ptr<Trigger::Response> resp)
@@ -593,14 +591,22 @@ private:
       return;
     }
 
-    // 폐루프 제어 (오차가 tolerance 이내면 해당 축 0)
+    // 폐루프 제어. CENTER: y축만 → ALIGN: y+yaw → APPROACH: x+y+yaw
     double vx = 0.0, vy = 0.0, wz = 0.0;
     bool center_ok = std::abs(f_center_) < lat_tol_;
     bool axis_ok = std::abs(f_axis_) < yaw_tol_;
-    if (!center_ok) {vy = kp_lat_ * f_center_;}
-    if (!axis_ok) {wz = kp_yaw_ * f_axis_;}
 
-    if (state_ == State::ALIGN) {
+    if (state_ == State::CENTER) {
+      // 1차: y축 이동으로만 대략 중앙에 맞춘 뒤 yaw 투입(먼 거리 + 큰 yaw에서 틀어짐 방지).
+      if (std::abs(f_center_) >= center_first_tol_) {
+        vy = kp_lat_ * f_center_;
+      } else {
+        state_ = State::ALIGN;
+        RCLCPP_INFO(get_logger(), "1차 중앙정렬 완료 → ALIGN(y+yaw)");
+      }
+    } else if (state_ == State::ALIGN) {
+      if (!center_ok) {vy = kp_lat_ * f_center_;}
+      if (!axis_ok) {wz = kp_yaw_ * f_axis_;}
       if (center_ok && axis_ok) {
         state_ = State::APPROACH;
         RCLCPP_INFO(get_logger(), "정면 정렬 완료 → APPROACH (z=%.3fm)", f_z_);
@@ -612,28 +618,39 @@ private:
         return;
       }
       vx = kp_fwd_ * (f_z_ - final_distance_);
+      if (!center_ok) {vy = kp_lat_ * f_center_;}
+      if (!axis_ok) {wz = kp_yaw_ * f_axis_;}
     }
 
     publishSmoothed(vx, vy, wz, dt);
+    const char * sn = state_ == State::CENTER ? "CENTER" :
+      (state_ == State::ALIGN ? "ALIGN" : "APPROACH");
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
       "[%s] z=%.3f e_center=%.3f e_axis=%.1fdeg | cmd v=(%.2f,%.2f) w=%.2f",
-      state_ == State::ALIGN ? "ALIGN" : "APPROACH",
-      f_z_, f_center_, rad2deg(f_axis_), last_vx_, last_vy_, last_wz_);
+      sn, f_z_, f_center_, rad2deg(f_axis_), last_vx_, last_vy_, last_wz_);
   }
 
   void publishSmoothed(double vx, double vy, double wz, double dt)
   {
+    // 1) 선속도 벡터 포화 + 각속도 클램프
     double sp = std::hypot(vx, vy);
     if (sp > max_lin_ && sp > 0.0) {double s = max_lin_ / sp; vx *= s; vy *= s;}
     wz = std::clamp(wz, -max_yaw_, max_yaw_);
-    sp = std::hypot(vx, vy);   // 데드밴드 대신 floor: 도착 전 멈춤(stall) 방지
-    if (sp > 1e-6 && sp < min_lin_) {double s = min_lin_ / sp; vx *= s; vy *= s;}
+    // 의도적으로 0 이 아닌 축 기록 → floor 는 이 축에만. (정렬 완료로 0 인 축은 0 으로 수렴)
+    bool nz_vx = std::abs(vx) > 1e-9, nz_vy = std::abs(vy) > 1e-9, nz_wz = std::abs(wz) > 1e-9;
+    // 2) 가속 제한(slew)
     if (have_prev_) {
       double dv = max_lin_acc_ * dt, dw = max_yaw_acc_ * dt;
       vx = last_vx_ + std::clamp(vx - last_vx_, -dv, dv);
       vy = last_vy_ + std::clamp(vy - last_vy_, -dv, dv);
       wz = last_wz_ + std::clamp(wz - last_wz_, -dw, dw);
     }
+    // 3) 하드웨어 최소속도 floor(축별). 데드존 아래로 못 가므로 명령을 최소값까지 끌어올림.
+    //    원래 0 이던 축은 건드리지 않아 정지 시 0 으로 수렴.
+    if (nz_vx && std::abs(vx) < min_vx_) {vx = std::copysign(min_vx_, vx);}
+    if (nz_vy && std::abs(vy) < min_vy_) {vy = std::copysign(min_vy_, vy);}
+    if (nz_wz && std::abs(wz) < min_wz_) {wz = std::copysign(min_wz_, wz);}
+
     geometry_msgs::msg::Twist cmd;
     cmd.linear.x = vx; cmd.linear.y = vy; cmd.angular.z = wz;
     pub_cmd_->publish(cmd);
@@ -686,7 +703,8 @@ private:
   int target_id_{1};
   bool auto_start_{false}, openloop_enabled_{true};
   double final_distance_{0.10};
-  double max_lin_{0.3}, max_yaw_{0.6}, max_lin_acc_{0.5}, max_yaw_acc_{1.0}, min_lin_{0.02};
+  double max_lin_{0.15}, max_yaw_{0.6}, max_lin_acc_{0.5}, max_yaw_acc_{1.0};
+  double min_vx_{0.05}, min_vy_{0.1}, min_wz_{0.02}, center_first_tol_{0.05};
   double kp_fwd_{0.8}, kp_lat_{1.0}, kp_yaw_{1.2};
   double dist_tol_{0.02}, lat_tol_{0.03}, yaw_tol_{deg2rad(5.0)};
   double filter_alpha_{0.5};
