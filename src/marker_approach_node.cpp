@@ -184,9 +184,20 @@ private:
 
   void process(cv::Mat img)
   {
+    // [임시 진단] 검출 직전 이미지 상태 출력 + detectMarkers 예외 포착(크래시 대신 로그).
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+      "[diag] before detect: img=%dx%d ch=%d type=%d intr.ok=%d",
+      img.cols, img.rows, img.channels(), img.type(), intr_.ok ? 1 : 0);
     cv::Mat K = intr_.ok ? scaleK(intr_.K, intr_.calib_w, intr_.calib_h, img.cols, img.rows) :
       cv::Mat();
-    auto markers = detectMarkers(*detector_, img, nullptr);  // init_pose 와 동일 (nullptr)
+    std::vector<Detection> markers;
+    try {
+      markers = detectMarkers(*detector_, img, nullptr);  // init_pose 와 동일 (nullptr)
+    } catch (const cv::Exception & e) {
+      RCLCPP_ERROR(get_logger(), "[diag] detectMarkers 예외 (img=%dx%d ch=%d): %s",
+        img.cols, img.rows, img.channels(), e.what());
+      return;
+    }
     auto t = now();
 
     for (const auto & [mid, corners] : markers) {

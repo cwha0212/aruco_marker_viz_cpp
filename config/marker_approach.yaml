@@ -13,7 +13,7 @@
     calib_resolution: [1280, 720]
     aruco_dict: DICT_4X4_50
     marker_size: 0.185
-    target_marker_id: 1        # 접근할 마커 ID
+    target_marker_id: 2        # 접근할 마커 ID
     max_reproj_error: 4.0
 
     # === 외부파라미터 (카메라 장착; marker_viz.yaml 과 동일) ===
