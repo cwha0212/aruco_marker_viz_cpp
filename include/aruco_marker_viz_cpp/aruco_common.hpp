@@ -129,6 +129,13 @@ struct MarkerDetector
     p.minOtsuStdDev = 5.0;
     p.errorCorrectionRate = 0.4;
     p.detectInvertedMarker = false;
+    // ★ ArUco3 검출은 반드시 끈다. 이 커스텀 OpenCV 4.8 빌드는 useAruco3Detection 이
+    //   기본생성자에서 초기화되지 않아(쓰레기값 true 가능) aruco3 canonical 리사이즈가
+    //   음수 크기를 만들어 setSize(s>=0) 로 죽는다(노드 메모리 배치에 따라 재현).
+    //   여기서 명시적으로 false 로 고정하면 모든 노드가 동일하게 안전.
+    p.useAruco3Detection = false;
+    p.minSideLengthCanonicalImg = 32;
+    p.minMarkerLengthRatioOriginalImg = 0.0f;
     return p;
   }
   void detect(
