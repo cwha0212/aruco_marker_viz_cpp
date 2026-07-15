@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <map>
 #include <optional>
 #include <set>
@@ -105,9 +106,12 @@ struct MarkerDetector
   static cv::aruco::DetectorParameters makeParams()
   {
     cv::aruco::DetectorParameters p;
-    // ★ 모든 필드를 명시적으로 설정한다. 이 커스텀 OpenCV 4.8 빌드에서 기본생성자가
-    //   일부 필드를 초기화하지 않으면(쓰레기값) detectMarkers 내부 크기 계산이 음수가
-    //   되어 setSize<0 로 죽는다(노드별 메모리 배치에 따라 재현). 명시 설정으로 제거.
+    // ★ 이 커스텀 OpenCV 4.8 빌드는 DetectorParameters 기본생성자가 일부 필드를
+    //   초기화하지 않아(쓰레기값) detectMarkers 내부 크기 계산이 음수가 되어
+    //   setSize<0 로 죽는다(노드 메모리 배치에 따라 재현). 이름으로 알 수 없는
+    //   커스텀 필드까지 잡기 위해 구조체 전체를 0 으로 밀고 시작한다(모두 POD 필드).
+    std::memset(static_cast<void *>(&p), 0, sizeof(p));
+    // 이어서 의미있는 필드를 전부 명시 설정.
     p.adaptiveThreshWinSizeMin = 3;
     p.adaptiveThreshWinSizeMax = 23;
     p.adaptiveThreshWinSizeStep = 10;
