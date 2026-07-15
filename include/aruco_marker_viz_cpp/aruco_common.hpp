@@ -129,6 +129,20 @@ struct MarkerDetector
     p.minOtsuStdDev = 5.0;
     p.errorCorrectionRate = 0.4;
     p.detectInvertedMarker = false;
+    // ★ ArUco3 / AprilTag 필드까지 전부 명시 초기화. 이 커스텀 OpenCV 4.8 빌드에서 이들이
+    //   쓰레기값이면 detectMarkers 내부(특히 aruco3 canonical 크기)에서 음수 크기가 되어
+    //   setSize(s>=0) assert 로 죽는다(노드 메모리 배치에 따라 재현). 기본값으로 고정.
+    p.useAruco3Detection = false;
+    p.minSideLengthCanonicalImg = 32;
+    p.minMarkerLengthRatioOriginalImg = 0.0f;
+    p.aprilTagQuadDecimate = 0.0f;
+    p.aprilTagQuadSigma = 0.0f;
+    p.aprilTagMinClusterPixels = 5;
+    p.aprilTagMaxNmaxima = 10;
+    p.aprilTagCriticalRad = static_cast<float>(10.0 * CV_PI / 180.0);
+    p.aprilTagMaxLineFitMse = 10.0f;
+    p.aprilTagMinWhiteBlackDiff = 5;
+    p.aprilTagDeglitch = 0;
     return p;
   }
   void detect(
