@@ -1,9 +1,8 @@
 // ArUco 마커를 인식해 '마커 정면 10cm 앞'까지 자동 접근하는 ROS2 노드 (C++).
 //
-// ★ 검출 경로(멤버 선언순서·검출기 생성 위치·process() 검출부)는
-//   init_pose_from_marker_node 와 "완전히 동일"하게 유지한다(이 환경의 OpenCV setSize
-//   크래시가 노드 메모리 배치에 민감해, 동작하는 노드와 검출부를 동일하게 두는 게 중요).
-//   그 뒤에 /cmd_vel 제어 로직만 얹는다.
+// ★ marker_viz_node.cpp 를 기반으로 작성한다(그 노드는 이 환경에서 크래시 없이 검출됨).
+//   검출 경로(파라미터 선언·검출기 생성 위치·process 검출부·멤버 배치)를 marker_viz 와
+//   동일하게 두고, 시각화/맵/초기위치 기능만 제거한 뒤 /cmd_vel 접근 제어를 얹는다.
 //
 // 로봇은 4족보행(홀로노믹 평면): x(전진)·y(횡이동)·yaw 만 제어. 높이(z-up)는 제어 불가라
 // 전부 지면 평면에 투영해 무시한다. 접근 2단계:
@@ -13,9 +12,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -48,13 +47,14 @@ public:
   MarkerApproachNode()
   : Node("marker_approach")
   {
-    // ===== 여기부터 init_pose_from_marker_node 와 동일한 '검출 설정' =====
+    // ===== 검출 설정: marker_viz_node.cpp 와 동일 (선언 순서·검출기 생성 위치 유지) =====
     image_topic_ = declare_parameter<std::string>("image_topic", "/camera/image_raw/compressed");
     bool uc = declare_parameter<bool>("use_compressed", true);
-    bool ends = image_topic_.size() >= 10 &&
+    bool ends_compressed = image_topic_.size() >= 10 &&
       image_topic_.compare(image_topic_.size() - 10, 10, "compressed") == 0;
-    use_compressed_ = uc || ends;
+    use_compressed_ = uc || ends_compressed;
     std::string dict = declare_parameter<std::string>("aruco_dict", "DICT_4X4_50");
+    std::string ids = declare_parameter<std::string>("ids", "");
     marker_size_ = declare_parameter<double>("marker_size", 0.185);
     std::string calib_file = declare_parameter<std::string>("calib_file", "");
     std::string cam_info_topic = declare_parameter<std::string>(
@@ -66,24 +66,32 @@ public:
     auto dist_coeffs = declare_parameter<std::vector<double>>(
       "dist_coeffs", {0.0, 0.0, 0.0, 0.0, 0.0});
     auto calib_res = declare_parameter<std::vector<int64_t>>("calib_resolution", {0, 0});
+    max_reproj_ = declare_parameter<double>("max_reproj_error", 4.0);
+    std::string odom_topic = declare_parameter<std::string>("odom_topic", "/aft_mapped_to_init");
     auto lidar_rpy = declare_parameter<std::vector<double>>(
       "lidar_mount_rpy_deg", {0.0, 0.0, 0.0});
     auto cam_xyz = declare_parameter<std::vector<double>>("cam_mount_xyz", {0.0, 0.0, 0.0});
     auto cam_rpy = declare_parameter<std::vector<double>>("cam_mount_rpy_deg", {0.0, 0.0, 0.0});
     target_id_ = declare_parameter<int>("target_marker_id", 1);
-    max_reproj_ = declare_parameter<double>("max_reproj_error", 4.0);
-    max_pose_age_ = declare_parameter<double>("max_pose_age_sec", 0.5);
+
+    // 허용 ID 파싱 (marker_viz 와 동일)
+    for (char & c : ids) {if (c == ',') {c = ' ';}}
+    std::istringstream iss(ids);
+    int vv;
+    while (iss >> vv) {allowed_ids_.insert(vv);}
+    has_id_filter_ = !allowed_ids_.empty();
 
     detector_ = std::make_unique<MarkerDetector>(dict);
     obj_pts_ = objectPoints(marker_size_);
     intr_ = buildIntrinsics(calib_file, fx, fy, cx, cy, dist_coeffs, calib_res);
     ext_ = buildBodyCamExtrinsic(lidar_rpy, cam_xyz, cam_rpy);
-    // ===== 여기까지 검출 설정 (init_pose 와 동일) =====
+    // ===== 여기까지 검출 설정 (marker_viz 와 동일) =====
 
-    // ----- 접근 제어 설정 (추가분) -----
+    // ----- 접근 제어 설정 -----
     std::string cmd_topic = declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
     auto_start_ = declare_parameter<bool>("auto_start", false);
     double rate = declare_parameter<double>("control_rate_hz", 20.0);
+    max_pose_age_ = declare_parameter<double>("max_pose_age_sec", 0.5);
     final_distance_ = declare_parameter<double>("final_distance", 0.10);
     max_lin_ = declare_parameter<double>("max_linear_speed", 0.3);
     max_yaw_ = declare_parameter<double>("max_yaw_rate", 0.6);
@@ -102,7 +110,6 @@ public:
     openloop_speed_ = declare_parameter<double>("openloop_speed", 0.1);
     openloop_max_dist_ = declare_parameter<double>("openloop_max_distance", 0.3);
     use_odom_ = declare_parameter<bool>("use_odom", true);
-    std::string odom_topic = declare_parameter<std::string>("odom_topic", "/aft_mapped_to_init");
 
     pub_cmd_ = create_publisher<geometry_msgs::msg::Twist>(cmd_topic, 10);
 
@@ -111,16 +118,16 @@ public:
       sub_cinfo_ = create_subscription<sensor_msgs::msg::CameraInfo>(
         cam_info_topic, qos, std::bind(&MarkerApproachNode::onCameraInfo, this, _1));
     }
+    if (use_odom_) {
+      sub_odom_ = create_subscription<nav_msgs::msg::Odometry>(
+        odom_topic, qos, std::bind(&MarkerApproachNode::onOdom, this, _1));
+    }
     if (use_compressed_) {
       sub_cimg_ = create_subscription<sensor_msgs::msg::CompressedImage>(
         image_topic_, qos, std::bind(&MarkerApproachNode::onCompressed, this, _1));
     } else {
       sub_img_ = create_subscription<sensor_msgs::msg::Image>(
         image_topic_, qos, std::bind(&MarkerApproachNode::onRaw, this, _1));
-    }
-    if (use_odom_) {
-      sub_odom_ = create_subscription<nav_msgs::msg::Odometry>(
-        odom_topic, qos, std::bind(&MarkerApproachNode::onOdom, this, _1));
     }
     srv_start_ = create_service<Trigger>(
       "~/start", std::bind(&MarkerApproachNode::onStart, this, _1, _2));
@@ -144,7 +151,7 @@ public:
 private:
   enum class State { IDLE, ALIGN, APPROACH, OPENLOOP, ARRIVED };
 
-  // ---------------- 검출 경로: init_pose_from_marker_node 와 동일 ----------------
+  // ---------------- 검출 경로: marker_viz 와 동일 ----------------
   void onCameraInfo(const sensor_msgs::msg::CameraInfo::SharedPtr msg)
   {
     if (intr_.ok) {return;}
@@ -188,7 +195,7 @@ private:
       cv::Mat();
     std::vector<Detection> markers;
     try {
-      markers = detectMarkers(*detector_, img, nullptr);  // init_pose 와 동일 (nullptr)
+      markers = detectMarkers(*detector_, img, has_id_filter_ ? &allowed_ids_ : nullptr);
     } catch (const cv::Exception & e) {  // 검출 예외로 제어 노드가 죽지 않도록 방어
       RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000, "detectMarkers 예외: %s", e.what());
       return;
@@ -207,7 +214,7 @@ private:
       double reproj = reprojectionError(obj_pts_, corners, rvec, tvec, K, intr_.dist);
       if (max_reproj_ > 0 && reproj > max_reproj_) {continue;}
 
-      // ↓↓↓ 여기까지 검출 경로는 init_pose 와 동일. 이후는 접근 제어용 관측 계산. ↓↓↓
+      // ↓↓↓ 검출부는 marker_viz 와 동일. 이후는 접근 제어용 관측 계산. ↓↓↓
       updateObservation(rvec, tvec, t);
     }
   }
@@ -398,13 +405,13 @@ private:
     have_prev_ = true;
   }
 
-  // ---- 파라미터/상수 (검출) ----
+  // ---- 파라미터/상수 (검출; marker_viz 와 동일 배치) ----
   std::string image_topic_;
-  bool use_compressed_{true};
+  bool use_compressed_{true}, has_id_filter_{false};
   int target_id_{1};
   double marker_size_{0.185}, max_reproj_{4.0}, max_pose_age_{0.5};
+  std::set<int> allowed_ids_;
 
-  // ---- 검출 자원 (init_pose 와 동일 순서) ----
   std::unique_ptr<MarkerDetector> detector_;
   std::vector<cv::Point3f> obj_pts_;
   Intrinsics intr_;
